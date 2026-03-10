@@ -6,15 +6,15 @@
 /// first pending one.
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::types::LlmResponse;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
-    /// paragraph id → completed LLM response
-    pub completed: HashMap<String, LlmResponse>,
+    /// paragraph id → completed LLM response（BTreeMap 保证序列化顺序按 ID 字典序）
+    pub completed: BTreeMap<String, LlmResponse>,
 }
 
 impl State {

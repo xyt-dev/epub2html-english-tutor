@@ -74,6 +74,7 @@ Rules:
 3. "chunks": pick 2-5 useful collocations, fixed phrases, or syntactic patterns from the paragraph that are worth learning. Focus on native-sounding expressions.
 4. Always output valid JSON. Escape any special characters properly.
 5. If a paragraph is too short or lacks rich vocabulary, keep the arrays empty ([]).
+6. IMPORTANT: The paragraph text you receive is ALWAYS complete, even if it ends with "..." or "…" (those are part of the original novel's punctuation, not a truncated message). Never ask for more text — always respond with the JSON object.
 "#;
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -116,7 +117,7 @@ impl LlmClient {
     async fn call_api(&self, paragraph_text: &str) -> Result<LlmResponse> {
         let req_body = ApiRequest {
             model: MODEL.to_string(),
-            max_tokens: 2048,
+            max_tokens: 4096,
             system: SYSTEM_PROMPT.to_string(),
             messages: vec![ApiMessage {
                 role: "user".to_string(),
@@ -151,27 +152,179 @@ impl LlmClient {
             .collect::<Vec<_>>()
             .join("");
 
-        // Strip markdown code fences if the model adds them
-        let json_str = strip_code_fences(&text);
+        // Strip markdown code fences if the model adds them, then extract JSON object
+        let json_str = extract_json(&text);
 
-        let llm_resp: LlmResponse =
-            serde_json::from_str(json_str).context("LLM returned invalid JSON")?;
+        let llm_resp: LlmResponse = serde_json::from_str(&json_str)
+            .with_context(|| {
+                let json_preview = truncate_str(&json_str, 600);
+                let raw_preview = truncate_str(&text, 200);
+                format!(
+                    "LLM returned invalid JSON.\nExtracted ({} chars):\n---\n{}\n---\nRaw ({} chars, first 200):\n---\n{}\n---",
+                    json_str.len(),
+                    json_preview,
+                    text.len(),
+                    raw_preview,
+                )
+            })?;
 
         Ok(llm_resp)
     }
 }
 
-fn strip_code_fences(s: &str) -> &str {
-    let s = s.trim();
-    // ```json ... ``` or ``` ... ```
-    if let Some(inner) = s.strip_prefix("```json") {
-        if let Some(inner2) = inner.strip_suffix("```") {
-            return inner2.trim();
+/// Best-effort extraction of a JSON object from LLM output.
+/// Handles: plain JSON, ```json fences, stray text before/after the object,
+/// and unescaped double-quotes inside string values (e.g. Chinese dialogue marks).
+fn extract_json(raw: &str) -> String {
+    let s = raw.trim();
+
+    // 1. Strip code fences using rfind to locate the closing ``` correctly.
+    //    trim_end_matches("```") fails when the LLM puts a newline after the
+    //    closing fence (e.g. "...\n}\n```\n"), because the string ends with \n.
+    let stripped = strip_code_fence(s);
+
+    // 2. If it parses cleanly now, return it
+    if serde_json::from_str::<serde_json::Value>(stripped).is_ok() {
+        return stripped.to_string();
+    }
+
+    // 3. Try repairing unescaped quotes first, then recheck
+    let repaired = repair_unescaped_quotes(stripped);
+    if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+        return repaired;
+    }
+
+    // 4. Scan for first '{' and match its closing '}' by depth
+    let bytes = stripped.as_bytes();
+    if let Some(start) = bytes.iter().position(|&b| b == b'{') {
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut escape = false;
+        for (i, &b) in bytes[start..].iter().enumerate() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match b {
+                b'\\' if in_str => escape = true,
+                b'"' => in_str = !in_str,
+                b'{' if !in_str => depth += 1,
+                b'}' if !in_str => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let candidate = &stripped[start..start + i + 1];
+                        let repaired2 = repair_unescaped_quotes(candidate);
+                        if serde_json::from_str::<serde_json::Value>(&repaired2).is_ok() {
+                            return repaired2;
+                        }
+                        return candidate.to_string();
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    if let Some(inner) = s.strip_prefix("```") {
-        if let Some(inner2) = inner.strip_suffix("```") {
-            return inner2.trim();
+
+    // 5. Fallback: return stripped as-is (will fail JSON parse with a useful error)
+    stripped.to_string()
+}
+
+/// Repair unescaped double-quotes inside JSON string values.
+///
+/// The LLM sometimes emits literal `"` characters inside string values without
+/// escaping them (e.g. `"translation": "She said "hello" to him"`).  We walk
+/// the raw bytes with a state machine:
+///   • outside a string  → `"` opens a string
+///   • inside a string   → `\` sets escape; then check if an unescaped `"` is a
+///                          genuine closing quote (next non-whitespace is `,` `:` `}` `]`)
+///                          or a spurious quote that should be escaped.
+fn repair_unescaped_quotes(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut out = Vec::with_capacity(n + 64);
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escape = false;
+
+    while i < n {
+        let b = bytes[i];
+
+        if escape {
+            escape = false;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' && in_str {
+            escape = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' {
+            if !in_str {
+                // Opening a string
+                in_str = true;
+                out.push(b);
+            } else {
+                // Could be closing the string OR an unescaped quote inside it.
+                // Look ahead past whitespace to see if the next non-space char
+                // is a JSON value terminator: , : } ]
+                let mut j = i + 1;
+                while j < n && matches!(bytes[j], b' ' | b'\t' | b'\r' | b'\n') {
+                    j += 1;
+                }
+                let next = if j < n { bytes[j] } else { 0 };
+                if matches!(next, b',' | b':' | b'}' | b']' | 0) {
+                    // Genuine closing quote
+                    in_str = false;
+                    out.push(b);
+                } else {
+                    // Unescaped quote inside value — escape it
+                    out.push(b'\\');
+                    out.push(b'"');
+                }
+            }
+        } else {
+            out.push(b);
+        }
+
+        i += 1;
+    }
+
+    // SAFETY: we only copied bytes from a valid UTF-8 string and inserted ASCII
+    // escape sequences, so the result is still valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Truncate a string to at most `max_bytes` bytes without splitting a UTF-8 character.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = max_bytes;
+    while !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
+/// Strip ```json or ``` fences, using rfind for the closing fence so that a
+/// trailing newline after the closing ``` doesn't break the extraction.
+fn strip_code_fence(s: &str) -> &str {
+    for prefix in &["```json", "```"] {
+        if let Some(after_open) = s.strip_prefix(prefix) {
+            // Remove the leading newline that follows the opening fence
+            let content = after_open.trim_start_matches('\n');
+            // Find the last ``` (the closing fence) and take everything before it
+            return if let Some(close) = content.rfind("```") {
+                content[..close].trim()
+            } else {
+                // No closing fence: the whole remainder is the JSON (truncated response)
+                content.trim()
+            };
         }
     }
     s

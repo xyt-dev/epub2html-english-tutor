@@ -13,13 +13,16 @@ use std::path::{Path, PathBuf};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // API key from environment variable
-    let api_key = std::env::var("ANTHROPIC_AUTH_TOKEN")
-        .context("ANTHROPIC_AUTH_TOKEN env var not set")?;
+    let args: Vec<String> = std::env::args().collect();
 
-    // Determine the novel directory — allow override via CLI arg
-    let novels_dir: PathBuf = std::env::args()
-        .nth(1)
+    // Check for --rebuild flag anywhere in args
+    let rebuild = args.iter().any(|a| a == "--rebuild");
+
+    // Novels dir: first non-flag arg after the binary name
+    let novels_dir: PathBuf = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("LightNovels"));
 
@@ -34,6 +37,22 @@ async fn main() -> Result<()> {
     }
     println!("Found {} epub file(s) under {}", epubs.len(), novels_dir.display());
 
+    if rebuild {
+        println!("Mode: --rebuild (从 state.json 重建 HTML，不调用 API)");
+        for epub_path in &epubs {
+            println!("\n─────────────────────────────────────────");
+            println!("Rebuilding: {}", epub_path.display());
+            match rebuild_html(epub_path, &output_dir) {
+                Ok(_) => println!("  ✓ Done"),
+                Err(e) => eprintln!("  ✗ Error: {:#}", e),
+            }
+        }
+        return Ok(());
+    }
+
+    // Normal translation mode — API key required
+    let api_key = std::env::var("ANTHROPIC_AUTH_TOKEN")
+        .context("ANTHROPIC_AUTH_TOKEN env var not set")?;
     let client = LlmClient::new(api_key);
 
     for epub_path in &epubs {
@@ -48,7 +67,68 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ─── Per-epub pipeline ────────────────────────────────────────────────────────
+// ─── Rebuild HTML from state.json (no API calls) ─────────────────────────────
+
+fn rebuild_html(epub_path: &Path, output_dir: &Path) -> Result<()> {
+    // 1. Parse epub
+    println!("  [1/3] Parsing epub…");
+    let book = epub_parser::parse_epub(epub_path)?;
+    let total_paras: usize = book.chapters.iter().map(|c| c.paragraphs.len()).sum();
+    println!(
+        "  Book: \"{}\" | {} chapters | {} paragraphs",
+        book.title, book.chapters.len(), total_paras
+    );
+
+    // 2. Load state
+    let state_path = state::state_path(output_dir, &book.slug);
+    let st = state::load_state(&state_path)?;
+    println!("  State: {} entries loaded", st.completed.len());
+
+    // 3. Generate fresh HTML skeleton, then patch every completed paragraph
+    println!("  [2/3] Generating HTML skeleton…");
+    let mut html = html_gen::generate_html(&book);
+
+    println!("  [3/3] Patching HTML from state…");
+    let pb = ProgressBar::new(st.completed.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}]",
+        )
+        .unwrap(),
+    );
+
+    // Build id→para lookup
+    let para_map: std::collections::HashMap<&str, &types::Paragraph> = book
+        .chapters
+        .iter()
+        .flat_map(|c| c.paragraphs.iter())
+        .map(|p| (p.id.as_str(), p))
+        .collect();
+
+    for (para_id, resp) in &st.completed {
+        if let Some(para) = para_map.get(para_id.as_str()) {
+            html = html_gen::patch_html(&html, para, resp);
+        }
+        pb.inc(1);
+    }
+    pb.finish_with_message("done");
+
+    // 4. Write HTML (atomic)
+    let html_path = output_dir.join(format!("{}.html", book.slug));
+    let tmp = html_path.with_extension("html.tmp");
+    std::fs::write(&tmp, &html)?;
+    std::fs::rename(&tmp, &html_path)?;
+
+    let done = st.completed.len();
+    println!(
+        "  Rebuilt: {}/{} paragraphs filled",
+        done, total_paras
+    );
+    println!("  HTML  → {}", html_path.display());
+    Ok(())
+}
+
+// ─── Per-epub translation pipeline ───────────────────────────────────────────
 
 async fn process_epub(
     epub_path: &Path,
@@ -84,6 +164,7 @@ async fn process_epub(
     // 3. LLM translation (resumable)
     println!("  [3/3] Translating paragraphs with Claude…");
     let mut st = state::load_state(&state_path)?;
+    println!("  State: {} (loaded {} entries)", state_path.display(), st.completed.len());
 
     let pending: Vec<(&str, &str)> = book
         .chapters
@@ -133,9 +214,6 @@ async fn process_epub(
                 }
 
                 // Write HTML first (atomic: write tmp → rename)
-                // Order matters: HTML before state. If we crash here, state won't record
-                // this para as done, so next run re-translates it (harmless extra API call).
-                // The reverse order would leave a permanent placeholder hole.
                 let tmp = html_path.with_extension("html.tmp");
                 std::fs::write(&tmp, &html_content)?;
                 std::fs::rename(&tmp, &html_path)?;

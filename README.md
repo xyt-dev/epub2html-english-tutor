@@ -41,11 +41,17 @@ cd epub-reader
 # 编译 release 版本（更快）
 cargo build --release
 
-# 运行（默认读取 ./LightNovels 目录下所有 .epub）
+# 翻译整个目录下所有 .epub（必须传路径）
 cargo run --release -- ../LightNovels
 
-# 或指定路径
-cargo run --release -- /path/to/epub/folder
+# 或只翻译单册
+cargo run --release -- ../LightNovels/vol1.epub
+
+# 自定义输出目录（默认 ./output）
+cargo run --release -- ../LightNovels ./my_output
+
+# 离线重建 HTML（不调 API，从已有 state.json 恢复）
+cargo run --release -- --rebuild ../LightNovels
 ```
 
 ### 输出位置
@@ -69,12 +75,13 @@ epub-reader/output/
 
 | 功能 | 说明 |
 |---|---|
-| epub 批量解析 | 递归扫描目录下所有 `.epub`，按 spine 顺序提取章节和段落 |
+| epub 批量解析 | 递归扫描目录，或直接传单个 `.epub` 文件 |
 | HTML 骨架生成 | 每段原文配三个折叠面板，初始内容为占位注释 |
 | Claude API 翻译 | 逐段调用 `claude-sonnet-4-6`，返回结构化 JSON |
 | 实时填空 | 每翻译完一段，立即将 JSON 内容渲染进 HTML 并写盘 |
 | 断点续传 | 状态持久化到 JSON 文件，中断后自动续传 |
 | 错误重试 | 每段最多重试 3 次，单段失败不影响整体进度 |
+| 离线重建 | `--rebuild` 模式从 state.json 恢复 HTML，无需调用 API |
 | 精美样式 | Tokyo Night 配色、折叠面板、顶部进度条、响应式布局 |
 
 ---

@@ -188,8 +188,8 @@ fn extract_json(raw: &str) -> String {
         return stripped.to_string();
     }
 
-    // 3. Try repairing unescaped quotes first, then recheck
-    let repaired = repair_unescaped_quotes(stripped);
+    // 3. Try repairs, then recheck
+    let repaired = repair(stripped);
     if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
         return repaired;
     }
@@ -213,7 +213,7 @@ fn extract_json(raw: &str) -> String {
                     depth -= 1;
                     if depth == 0 {
                         let candidate = &stripped[start..start + i + 1];
-                        let repaired2 = repair_unescaped_quotes(candidate);
+                        let repaired2 = repair(candidate);
                         if serde_json::from_str::<serde_json::Value>(&repaired2).is_ok() {
                             return repaired2;
                         }
@@ -227,6 +227,63 @@ fn extract_json(raw: &str) -> String {
 
     // 5. Fallback: return stripped as-is (will fail JSON parse with a useful error)
     stripped.to_string()
+}
+
+/// Apply all known LLM JSON output repairs in sequence.
+fn repair(s: &str) -> String {
+    let s = repair_missing_colon(s);
+    repair_unescaped_quotes(&s)
+}
+
+/// Fix `"key"[` or `"key"{` → `"key":[` / `"key":{`
+/// The LLM occasionally omits the `:` between a key and its array/object value.
+fn repair_missing_colon(s: &str) -> String {
+    // Simple byte scan: when outside a string we look for `"` immediately
+    // followed (ignoring spaces) by `[` or `{` — insert `:` between them.
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    let mut out = Vec::with_capacity(n + 8);
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escape = false;
+
+    while i < n {
+        let b = bytes[i];
+
+        if escape {
+            escape = false;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && in_str {
+            escape = true;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_str = !in_str;
+            out.push(b);
+            i += 1;
+            // After closing a string key, peek ahead for missing colon
+            if !in_str {
+                let mut j = i;
+                while j < n && matches!(bytes[j], b' ' | b'\t' | b'\r' | b'\n') {
+                    j += 1;
+                }
+                if j < n && matches!(bytes[j], b'[' | b'{') {
+                    out.push(b':');
+                }
+            }
+            continue;
+        }
+
+        out.push(b);
+        i += 1;
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Repair unescaped double-quotes inside JSON string values.

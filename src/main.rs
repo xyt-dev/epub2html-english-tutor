@@ -18,24 +18,34 @@ async fn main() -> Result<()> {
     // Check for --rebuild flag anywhere in args
     let rebuild = args.iter().any(|a| a == "--rebuild");
 
-    // Novels dir: first non-flag arg after the binary name
-    let novels_dir: PathBuf = args
+    // Path: first non-flag arg (required) — can be a .epub file or a directory
+    let path_arg = args
         .iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("LightNovels"));
+        .ok_or_else(|| anyhow::anyhow!(
+            "Usage: epub-reader [--rebuild] <epub_file_or_dir> [output_dir]\n\
+             Examples:\n  epub-reader ../LightNovels\n  epub-reader book.epub\n  epub-reader ../LightNovels ./out"
+        ))?;
 
-    let output_dir = PathBuf::from("output");
+    // Optional second non-flag arg overrides output directory (default: ./output)
+    let output_dir: PathBuf = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("output"));
     std::fs::create_dir_all(&output_dir)?;
 
-    // Collect all epub files
-    let epubs = collect_epubs(&novels_dir)?;
+    // Collect epub(s): single file or recursive directory scan
+    let epubs = collect_epubs(&path_arg)?;
     if epubs.is_empty() {
-        eprintln!("No .epub files found under {}", novels_dir.display());
+        eprintln!("No .epub files found under {}", path_arg.display());
         return Ok(());
     }
-    println!("Found {} epub file(s) under {}", epubs.len(), novels_dir.display());
+    println!("Found {} epub file(s)", epubs.len());
 
     if rebuild {
         println!("Mode: --rebuild (从 state.json 重建 HTML，不调用 API)");
@@ -49,7 +59,6 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-
     // Normal translation mode — API key required
     let api_key = std::env::var("ANTHROPIC_AUTH_TOKEN")
         .context("ANTHROPIC_AUTH_TOKEN env var not set")?;
@@ -237,15 +246,23 @@ async fn process_epub(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn collect_epubs(dir: &Path) -> Result<Vec<PathBuf>> {
-    if !dir.exists() {
-        anyhow::bail!(
-            "Novel directory '{}' does not exist. Pass the path as the first argument.",
-            dir.display()
-        );
+fn collect_epubs(path: &Path) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        anyhow::bail!("Path '{}' does not exist.", path.display());
     }
+    // Single epub file
+    if path.is_file() {
+        if path.extension().map(|e| e == "epub").unwrap_or(false) {
+            return Ok(vec![path.to_path_buf()]);
+        }
+        anyhow::bail!("'{}' is not an .epub file.", path.display());
+    }
+    // Directory: recursive scan
     let mut epubs = Vec::new();
-    visit_dir(dir, &mut epubs)?;
+    visit_dir(path, &mut epubs)?;
+    if epubs.is_empty() {
+        anyhow::bail!("No .epub files found in '{}'.", path.display());
+    }
     epubs.sort();
     Ok(epubs)
 }

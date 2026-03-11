@@ -179,7 +179,7 @@ async fn process_epub(
         .chapters
         .iter()
         .flat_map(|c| c.paragraphs.iter())
-        .filter(|p| !st.is_done(&p.id))
+        .filter(|p| !st.is_done(&p.id) && !p.text.trim().is_empty())
         .map(|p| (p.id.as_str(), p.text.as_str()))
         .collect();
 

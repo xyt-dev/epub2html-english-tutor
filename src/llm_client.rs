@@ -74,7 +74,7 @@ Rules:
 3. "chunks": pick 2-5 useful collocations, fixed phrases, or syntactic patterns from the paragraph that are worth learning. Focus on native-sounding expressions.
 4. Always output valid JSON. Escape any special characters properly.
 5. If a paragraph is too short or lacks rich vocabulary, keep the arrays empty ([]).
-6. IMPORTANT: The paragraph text you receive is ALWAYS complete, even if it ends with "..." or "…" (those are part of the original novel's punctuation, not a truncated message). Never ask for more text — always respond with the JSON object.
+6. CRITICAL: You will NEVER ask for clarification, never say the message is cut off, and never ask for more text. The paragraph between <paragraph> and </paragraph> tags is ALWAYS the complete input. Always respond with the JSON object, no matter what.
 "#;
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ impl LlmClient {
             system: SYSTEM_PROMPT.to_string(),
             messages: vec![ApiMessage {
                 role: "user".to_string(),
-                content: paragraph_text.to_string(),
+                content: format!("<paragraph>{}</paragraph>", paragraph_text),
             }],
         };
 

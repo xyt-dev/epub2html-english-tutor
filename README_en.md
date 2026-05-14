@@ -17,6 +17,7 @@
 - Sends contiguous paragraphs in batches and carries explicit paragraph IDs in both request and response payloads
 - Supports `Ctrl+C` interrupt and resume without redoing completed paragraphs
 - Supports `--rebuild` to regenerate HTML from state files without API calls
+- Supports `--count` to count only text that would be sent to a third-party model, without API calls or output files
 - Supports `--jobs` for concurrent requests and `--request-delay-ms` for throttling
 - Default batching strategy: target about `5000` effective chars, hard cap `7000`, max `10` paragraphs per request, with automatic single-paragraph fallback on batch failure
 - TXT / Markdown segmentation behavior can be tuned from the CLI
@@ -91,7 +92,26 @@ Notes:
 - `--jobs` controls concurrent batch requests, not concurrent single paragraphs
 - Each batch keeps contiguous paragraphs and tries to stay within `7000` effective characters
 
-### 7. Rebuild HTML offline
+### 7. Count text before sending
+
+No API calls and no HTML output. Count only the source text that would enter translation requests:
+
+```bash
+cargo run --release -- --count ./books
+```
+
+The count includes:
+
+- translatable paragraph count
+- effective non-space character count
+- effective Chinese character count
+- English word count
+- request batch count
+- estimated input tokens after current batching and prompt wrapping
+
+Code blocks, navigation pages, and text filtered by parsing rules are excluded.
+
+### 8. Rebuild HTML offline
 
 No API calls. Recreate HTML only from existing `*_state.json` files:
 
@@ -113,6 +133,8 @@ Arguments:
 Options:
       --rebuild
           Rebuild HTML from existing state files without API calls
+      --count
+          Count translatable source text and exit without API calls or output files
       --jobs <JOBS>
           Maximum number of concurrent translation requests [default: 2]
       --request-delay-ms <REQUEST_DELAY_MS>
@@ -269,6 +291,7 @@ Current defaults:
 - Hard per-batch cap: `7000` effective characters
 - Maximum per batch: `10` paragraphs
 - Single paragraph over `2800` effective characters: sent alone
+- Runtime output shows queued batch chars and estimated input tokens including the prompt / `items` wrapper
 - Batch failure: automatically falls back to single-paragraph requests
 
 This keeps the system prompt cost lower, preserves local reading context, and still lets HTML / state updates stay deterministic.

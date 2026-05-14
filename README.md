@@ -17,6 +17,7 @@
 - 连续段落会按批次请求 Claude，并在请求和响应里显式携带段落 ID
 - 支持 `Ctrl+C` 中断后继续跑，已完成段落不会重复请求
 - 支持 `--rebuild` 离线重建 HTML，不调用 API
+- 支持 `--count` 只统计会发送给第三方模型的有效文本，不调用 API、不写输出文件
 - 支持 `--jobs` 控制并发请求数，支持 `--request-delay-ms` 节流
 - 默认批处理策略：目标约 `5000` 有效字符、硬上限 `7000`、每批最多 `10` 段，批失败会自动降级为逐段重试
 - TXT / Markdown 分段规则可通过 CLI 参数调节
@@ -91,7 +92,26 @@ cargo run --release -- --jobs 3 --request-delay-ms 250 ./books
 - `--jobs` 控制同时进行的批请求数，而不是单段请求数
 - 每个批次默认会尽量保持连续段落，并把有效字符数控制在 `7000` 以内
 
-### 7. 离线重建 HTML
+### 7. 统计发送前文本量
+
+不调 API，不生成 HTML，只统计会进入翻译请求的正文：
+
+```bash
+cargo run --release -- --count ./books
+```
+
+统计结果包含：
+
+- 可翻译段落数
+- 去空白后的有效字符数
+- 有效中文字数
+- 英文单词数
+- 请求批次数
+- 按当前批处理和 prompt 包装估算的输入 token 数
+
+代码块、目录页、被解析规则过滤掉的内容不会计入。
+
+### 8. 离线重建 HTML
 
 不调 API，只根据已有 `*_state.json` 重新生成 HTML：
 
@@ -113,6 +133,8 @@ Arguments:
 Options:
       --rebuild
           Rebuild HTML from existing state files without API calls
+      --count
+          Count translatable source text and exit without API calls or output files
       --jobs <JOBS>
           Maximum number of concurrent translation requests [default: 2]
       --request-delay-ms <REQUEST_DELAY_MS>
@@ -269,6 +291,7 @@ output/
 - 单批硬上限：`7000` 个有效字符
 - 单批最多：`10` 段
 - 单段超过 `2800` 有效字符：单独发送
+- 运行时会显示待发送批次的有效字符数和包含 prompt / `items` 包装后的输入 token 估算
 - 批请求失败：自动回退为逐段请求
 
 这样做的目的是：

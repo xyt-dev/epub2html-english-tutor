@@ -7,16 +7,20 @@ mod parse_utils;
 mod parser;
 mod state;
 mod text_parser;
+mod token_estimator;
 mod types;
 mod ui;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
+use console::{measure_text_width, pad_str, Alignment, Term};
 use indicatif::ProgressBar;
 use llm_client::{LlmClient, TranslationRequest};
 use parse_utils::ParseOptions;
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
@@ -26,7 +30,7 @@ use tokio::task::JoinSet;
     version,
     about = "Convert EPUB/Markdown/Text books into annotated HTML with AI translation.",
     long_about = None,
-    after_help = "Examples:\n  epub-reader ../Books\n  epub-reader novel.epub\n  epub-reader notes.md ./out\n  epub-reader --jobs 3 novel.epub\n  epub-reader --txt-hard-linebreaks notes.txt ./out\n  epub-reader --rebuild ../Books ./out"
+    after_help = "Examples:\n  epub-reader ../Books\n  epub-reader novel.epub\n  epub-reader notes.md ./out\n  epub-reader --count ../Books\n  epub-reader --jobs 3 novel.epub\n  epub-reader --txt-hard-linebreaks notes.txt ./out\n  epub-reader --rebuild ../Books ./out"
 )]
 struct Args {
     #[arg(
@@ -47,6 +51,12 @@ struct Args {
         help = "Rebuild HTML from existing state files without API calls"
     )]
     rebuild: bool,
+
+    #[arg(
+        long,
+        help = "Count translatable source text and exit without API calls or output files"
+    )]
+    count: bool,
 
     #[arg(
         long,
@@ -122,6 +132,51 @@ struct PendingParagraph {
 #[derive(Debug, Clone)]
 struct PendingBatch {
     paragraphs: Vec<PendingParagraph>,
+    metrics: BatchMetrics,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BatchMetrics {
+    effective_chars: usize,
+    input_tokens_estimate: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BatchSummary {
+    request_count: usize,
+    effective_chars: usize,
+    input_tokens_estimate: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CountStats {
+    books: usize,
+    chapters: usize,
+    paragraphs: usize,
+    effective_chars: usize,
+    chinese_chars: usize,
+    english_words: usize,
+    request_count: usize,
+    input_tokens_estimate: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CountRow {
+    title: String,
+    stats: CountStats,
+}
+
+impl CountStats {
+    fn add(&mut self, other: &Self) {
+        self.books += other.books;
+        self.chapters += other.chapters;
+        self.paragraphs += other.paragraphs;
+        self.effective_chars += other.effective_chars;
+        self.chinese_chars += other.chinese_chars;
+        self.english_words += other.english_words;
+        self.request_count += other.request_count;
+        self.input_tokens_estimate += other.input_tokens_estimate;
+    }
 }
 
 #[derive(Debug)]
@@ -133,6 +188,7 @@ struct ParagraphTaskResult {
 #[derive(Debug)]
 struct TranslationTaskResult {
     items: Vec<ParagraphTaskResult>,
+    metrics: BatchMetrics,
 }
 
 const BATCH_TARGET_CHARS: usize = 5_000;
@@ -144,9 +200,14 @@ const SINGLE_PARAGRAPH_CHARS: usize = 2_800;
 async fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
-    std::fs::create_dir_all(&args.output_dir)?;
 
     let parse_options = parse_options_from_args(&args);
+    if args.count {
+        return count_inputs(&args.input, &parse_options);
+    }
+
+    std::fs::create_dir_all(&args.output_dir)?;
+
     let translation_options = TranslationOptions {
         jobs: args.jobs,
         request_delay: Duration::from_millis(args.request_delay_ms),
@@ -349,11 +410,14 @@ async fn process_input(
 
     let para_map = build_para_map(&book);
     let pending_batches = build_translation_batches(pending);
+    let pending_summary = summarize_batches(&pending_batches);
     ui::print_kv(
         "batching",
         format!(
-            "{} request(s) queued from remaining paragraphs",
-            pending_batches.len()
+            "{} request(s) · {} char(s) · ~{} input token(s) queued",
+            pending_summary.request_count,
+            pending_summary.effective_chars,
+            pending_summary.input_tokens_estimate
         ),
     );
     let mut join_set = JoinSet::new();
@@ -371,6 +435,7 @@ async fn process_input(
 
     while let Some(joined) = join_set.join_next().await {
         let task = joined.context("translation worker panicked")?;
+        let batch_metrics = task.metrics;
         let batch_size = task.items.len();
         let last_id = task
             .items
@@ -409,9 +474,10 @@ async fn process_input(
             pb.set_message("finalizing".to_string());
         } else {
             pb.set_message(format!(
-                "active={} · batch={} · last={}",
+                "active={} · batch={} · ~{} tokens · last={}",
                 join_set.len(),
                 batch_size,
+                batch_metrics.input_tokens_estimate,
                 last_id
             ));
         }
@@ -436,6 +502,250 @@ fn build_para_map<'a>(book: &'a types::Book) -> HashMap<&'a str, &'a types::Para
         .collect()
 }
 
+fn count_inputs(input_root: &Path, parse_options: &ParseOptions) -> Result<()> {
+    let inputs = collect_inputs(input_root)?;
+    ui::print_input_summary(input_root, inputs.len());
+
+    let mut total = CountStats::default();
+    let mut rows = Vec::new();
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+
+    for input_path in &inputs {
+        match parser::parse_book(input_path, parse_options) {
+            Ok(book) => {
+                let stats = count_book(&book);
+                let title = book.title;
+                succeeded += 1;
+                total.add(&stats);
+                rows.push(CountRow { title, stats });
+            }
+            Err(err) => {
+                failed += 1;
+                ui::print_error(format!("{}: {:#}", input_path.display(), err));
+            }
+        }
+    }
+
+    if !rows.is_empty() {
+        println!();
+        print_count_table(&rows, (rows.len() > 1).then_some(&total));
+    }
+    ui::print_run_summary(succeeded, failed);
+    Ok(())
+}
+
+fn print_count_table(rows: &[CountRow], total: Option<&CountStats>) {
+    ui::print_step("count", "estimated request size");
+    for line in render_count_output(rows, total, terminal_width()) {
+        println!("{}", line);
+    }
+}
+
+fn render_count_output(
+    rows: &[CountRow],
+    total: Option<&CountStats>,
+    terminal_width: usize,
+) -> Vec<String> {
+    let title_width = rows
+        .iter()
+        .map(|row| measure_text_width(&row.title))
+        .chain(total.map(|_| measure_text_width("total")))
+        .max()
+        .unwrap_or_else(|| measure_text_width("book"))
+        .max(measure_text_width("book"));
+    let table = render_count_table(rows, total, title_width);
+    let table_width = table
+        .iter()
+        .map(|line| measure_text_width(line))
+        .max()
+        .unwrap_or_default();
+
+    if table_width <= terminal_width {
+        table
+    } else {
+        render_count_list(rows, total)
+    }
+}
+
+fn render_count_table(
+    rows: &[CountRow],
+    total: Option<&CountStats>,
+    title_width: usize,
+) -> Vec<String> {
+    let headers = ["book", "ch", "para", "chars", "zh", "en", "req", "~tokens"];
+    let aligns = [
+        Alignment::Left,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+        Alignment::Right,
+    ];
+
+    let body = rows
+        .iter()
+        .map(|row| count_table_cells(&row.title, &row.stats, title_width))
+        .collect::<Vec<_>>();
+    let total_row = total.map(|stats| count_table_cells("total", stats, title_width));
+
+    let mut widths = headers
+        .iter()
+        .map(|header| measure_text_width(header))
+        .collect::<Vec<_>>();
+    for row in body.iter().chain(total_row.iter()) {
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(measure_text_width(cell));
+        }
+    }
+
+    let rule = render_table_rule(&widths);
+    let mut lines = Vec::with_capacity(body.len() + 5);
+    lines.push(rule.clone());
+    lines.push(render_table_row(&headers, &widths, &aligns));
+    lines.push(rule.clone());
+    for row in &body {
+        lines.push(render_table_row(row, &widths, &aligns));
+    }
+    if let Some(row) = &total_row {
+        lines.push(rule.clone());
+        lines.push(render_table_row(row, &widths, &aligns));
+    }
+    lines.push(rule);
+    lines
+}
+
+fn count_table_cells(title: &str, stats: &CountStats, title_width: usize) -> Vec<String> {
+    vec![
+        pad_str(title, title_width, Alignment::Left, None).to_string(),
+        format_count(stats.chapters),
+        format_count(stats.paragraphs),
+        format_count(stats.effective_chars),
+        format_count(stats.chinese_chars),
+        format_count(stats.english_words),
+        format_count(stats.request_count),
+        format!("~{}", format_count(stats.input_tokens_estimate)),
+    ]
+}
+
+fn render_count_list(rows: &[CountRow], total: Option<&CountStats>) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for row in rows {
+        lines.extend(render_count_list_item(&row.title, &row.stats));
+    }
+    if let Some(stats) = total {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.extend(render_count_list_item("total", stats));
+    }
+
+    lines
+}
+
+fn render_count_list_item(title: &str, stats: &CountStats) -> Vec<String> {
+    vec![
+        title.to_string(),
+        format!(
+            "  para={} chars={} req={} ~tokens={}",
+            format_count(stats.paragraphs),
+            format_count(stats.effective_chars),
+            format_count(stats.request_count),
+            format_count(stats.input_tokens_estimate)
+        ),
+        format!(
+            "  ch={} zh={} en={}",
+            format_count(stats.chapters),
+            format_count(stats.chinese_chars),
+            format_count(stats.english_words)
+        ),
+    ]
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|cols| cols.parse::<usize>().ok())
+        .filter(|cols| *cols > 0)
+        .unwrap_or_else(|| Term::stdout().size().1 as usize)
+}
+
+fn render_table_rule(widths: &[usize]) -> String {
+    let parts = widths
+        .iter()
+        .map(|width| "-".repeat(width + 2))
+        .collect::<Vec<_>>();
+    format!("+{}+", parts.join("+"))
+}
+
+fn render_table_row<S: AsRef<str>>(cells: &[S], widths: &[usize], aligns: &[Alignment]) -> String {
+    let parts = cells
+        .iter()
+        .zip(widths.iter())
+        .zip(aligns.iter())
+        .map(|((cell, width), align)| {
+            format!(
+                " {} ",
+                pad_str(cell.as_ref(), *width, *align, None).as_ref()
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("|{}|", parts.join("|"))
+}
+
+fn format_count(value: usize) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    let first_group_len = raw.len() % 3;
+
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx > 0
+            && (idx == first_group_len
+                || (idx > first_group_len && (idx - first_group_len) % 3 == 0))
+        {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+
+    out
+}
+
+fn count_book(book: &types::Book) -> CountStats {
+    let mut stats = CountStats {
+        books: 1,
+        chapters: book.chapters.len(),
+        ..Default::default()
+    };
+
+    let pending = book
+        .chapters
+        .iter()
+        .flat_map(|chapter| chapter.paragraphs.iter())
+        .filter(|para| para.is_translatable() && !para.text.trim().is_empty())
+        .map(|para| PendingParagraph {
+            para_id: para.id.clone(),
+            para_text: para.text.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    for para in &pending {
+        stats.paragraphs += 1;
+        stats.effective_chars += token_estimator::effective_text_chars(&para.para_text);
+        stats.chinese_chars += count_chinese_chars(&para.para_text);
+        stats.english_words += count_english_words(&para.para_text);
+    }
+
+    let batch_summary = summarize_batches(&build_translation_batches(pending));
+    stats.request_count = batch_summary.request_count;
+    stats.input_tokens_estimate = batch_summary.input_tokens_estimate;
+
+    stats
+}
+
 async fn fill_translation_queue(
     join_set: &mut JoinSet<TranslationTaskResult>,
     pending_iter: &mut std::vec::IntoIter<PendingBatch>,
@@ -454,6 +764,7 @@ async fn fill_translation_queue(
 
         let client = client.clone();
         join_set.spawn(async move {
+            let metrics = job.metrics;
             let request_items = job
                 .paragraphs
                 .iter()
@@ -498,7 +809,7 @@ async fn fill_translation_queue(
                     .collect(),
             };
 
-            TranslationTaskResult { items }
+            TranslationTaskResult { items, metrics }
         });
         *launched_any = true;
     }
@@ -509,11 +820,11 @@ fn build_translation_batches(pending: Vec<PendingParagraph>) -> Vec<PendingBatch
     let mut iter = pending.into_iter().peekable();
 
     while let Some(first) = iter.next() {
-        let mut total_chars = effective_text_chars(&first.para_text);
+        let mut total_chars = token_estimator::effective_text_chars(&first.para_text);
         let mut paragraphs = vec![first];
 
         if total_chars > SINGLE_PARAGRAPH_CHARS {
-            batches.push(PendingBatch { paragraphs });
+            batches.push(make_pending_batch(paragraphs));
             continue;
         }
 
@@ -526,7 +837,7 @@ fn build_translation_batches(pending: Vec<PendingParagraph>) -> Vec<PendingBatch
                 break;
             };
 
-            let next_chars = effective_text_chars(&next.para_text);
+            let next_chars = token_estimator::effective_text_chars(&next.para_text);
             if next_chars > SINGLE_PARAGRAPH_CHARS {
                 break;
             }
@@ -539,14 +850,63 @@ fn build_translation_batches(pending: Vec<PendingParagraph>) -> Vec<PendingBatch
             paragraphs.push(iter.next().unwrap());
         }
 
-        batches.push(PendingBatch { paragraphs });
+        batches.push(make_pending_batch(paragraphs));
     }
 
     batches
 }
 
-fn effective_text_chars(text: &str) -> usize {
-    text.chars().filter(|c| !c.is_whitespace()).count()
+fn make_pending_batch(paragraphs: Vec<PendingParagraph>) -> PendingBatch {
+    let metrics = estimate_batch_metrics(&paragraphs);
+    PendingBatch {
+        paragraphs,
+        metrics,
+    }
+}
+
+fn count_chinese_chars(text: &str) -> usize {
+    text.chars()
+        .filter(|&ch| token_estimator::is_han_char(ch))
+        .count()
+}
+
+fn estimate_batch_metrics(paragraphs: &[PendingParagraph]) -> BatchMetrics {
+    let effective_chars = paragraphs
+        .iter()
+        .map(|paragraph| token_estimator::effective_text_chars(&paragraph.para_text))
+        .sum();
+    let request_items = paragraphs
+        .iter()
+        .map(|paragraph| TranslationRequest {
+            id: paragraph.para_id.as_str(),
+            text: paragraph.para_text.as_str(),
+        })
+        .collect::<Vec<_>>();
+    let input_tokens_estimate = llm_client::estimate_translation_input_tokens(&request_items);
+
+    BatchMetrics {
+        effective_chars,
+        input_tokens_estimate,
+    }
+}
+
+fn summarize_batches(batches: &[PendingBatch]) -> BatchSummary {
+    let mut summary = BatchSummary::default();
+
+    for batch in batches {
+        summary.request_count += 1;
+        summary.effective_chars += batch.metrics.effective_chars;
+        summary.input_tokens_estimate += batch.metrics.input_tokens_estimate;
+    }
+
+    summary
+}
+
+fn count_english_words(text: &str) -> usize {
+    static ENGLISH_WORD_RE: OnceLock<Regex> = OnceLock::new();
+    let re = ENGLISH_WORD_RE
+        .get_or_init(|| Regex::new(r"[A-Za-z][A-Za-z0-9]*(?:['’-][A-Za-z0-9]+)*").unwrap());
+    re.find_iter(text).count()
 }
 
 fn parse_options_from_args(args: &Args) -> ParseOptions {
@@ -560,10 +920,13 @@ fn parse_options_from_args(args: &Args) -> ParseOptions {
 }
 
 fn validate_args(args: &Args) -> Result<()> {
-    if args.jobs == 0 {
+    if args.count && args.rebuild {
+        anyhow::bail!("--count cannot be used together with --rebuild");
+    }
+    if !args.count && args.jobs == 0 {
         anyhow::bail!("--jobs must be at least 1");
     }
-    if args.jobs > 16 {
+    if !args.count && args.jobs > 16 {
         anyhow::bail!("--jobs must be 16 or smaller");
     }
     if args.min_paragraph_chars == 0 {
@@ -669,7 +1032,120 @@ mod tests {
 
     #[test]
     fn effective_text_chars_ignores_whitespace() {
-        assert_eq!(effective_text_chars("ab c\n d\t"), 4);
+        assert_eq!(token_estimator::effective_text_chars("ab c\n d\t"), 4);
+    }
+
+    #[test]
+    fn counts_chinese_chars_without_punctuation() {
+        assert_eq!(count_chinese_chars("你好，world！學習"), 4);
+    }
+
+    #[test]
+    fn counts_english_words_with_contractions_and_hyphens() {
+        assert_eq!(
+            count_english_words("Don't split well-known words, but count API v2."),
+            8
+        );
+    }
+
+    #[test]
+    fn count_book_skips_code_blocks() {
+        let book = types::Book {
+            slug: "sample".to_string(),
+            title: "Sample".to_string(),
+            chapters: vec![types::Chapter {
+                index: 1,
+                title: Some("One".to_string()),
+                paragraphs: vec![
+                    types::Paragraph {
+                        id: "p1".to_string(),
+                        text: "Hello world 你好".to_string(),
+                        kind: types::ParagraphKind::Text,
+                    },
+                    types::Paragraph {
+                        id: "p2".to_string(),
+                        text: "fn main() {}".to_string(),
+                        kind: types::ParagraphKind::CodeBlock {
+                            language: Some("rust".to_string()),
+                        },
+                    },
+                ],
+            }],
+        };
+
+        let stats = count_book(&book);
+        assert_eq!(stats.books, 1);
+        assert_eq!(stats.chapters, 1);
+        assert_eq!(stats.paragraphs, 1);
+        assert_eq!(stats.chinese_chars, 2);
+        assert_eq!(stats.english_words, 2);
+        assert_eq!(stats.request_count, 1);
+        assert!(stats.input_tokens_estimate > 0);
+    }
+
+    #[test]
+    fn batching_records_token_estimates() {
+        let pending = vec![pending("p1", 300), pending("p2", 200)];
+        let batches = build_translation_batches(pending);
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].metrics.effective_chars, 500);
+        assert!(batches[0].metrics.input_tokens_estimate > 0);
+    }
+
+    #[test]
+    fn formats_count_values_with_grouping() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(123_456_789), "123,456,789");
+    }
+
+    #[test]
+    fn count_table_includes_total_row() {
+        let stats = CountStats {
+            books: 1,
+            chapters: 2,
+            paragraphs: 3,
+            effective_chars: 4_000,
+            chinese_chars: 5,
+            english_words: 6,
+            request_count: 7,
+            input_tokens_estimate: 8_900,
+        };
+        let rows = vec![CountRow {
+            title: "A Very Long Book Title That Should Be Truncated In Count Tables".to_string(),
+            stats: stats.clone(),
+        }];
+
+        let table = render_count_output(&rows, Some(&stats), 120).join("\n");
+        assert!(table.contains("book"));
+        assert!(table.contains("total"));
+        assert!(table.contains("4,000"));
+        assert!(table.contains("A Very Long Book Title That Should Be Truncated In Count Tables"));
+    }
+
+    #[test]
+    fn count_output_uses_list_when_terminal_is_narrow() {
+        let stats = CountStats {
+            books: 1,
+            chapters: 2,
+            paragraphs: 3,
+            effective_chars: 4_000,
+            chinese_chars: 5,
+            english_words: 6,
+            request_count: 7,
+            input_tokens_estimate: 8_900,
+        };
+        let rows = vec![CountRow {
+            title: "Sample Book With Full Title".to_string(),
+            stats,
+        }];
+
+        let output = render_count_output(&rows, None, 50).join("\n");
+        assert!(!output.contains('|'));
+        assert!(output.contains("Sample Book With Full Title"));
+        assert!(output.contains("~tokens=8,900"));
     }
 }
 

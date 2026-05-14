@@ -99,6 +99,12 @@ pub struct TranslationResult {
     pub response: LlmResponse,
 }
 
+pub fn estimate_translation_input_tokens(items: &[TranslationRequest<'_>]) -> usize {
+    let content =
+        serialize_batch_input(items).expect("serializing translation batch input should not fail");
+    crate::token_estimator::estimate_message_input_tokens(SYSTEM_PROMPT, &content)
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     client: Client,
@@ -148,16 +154,7 @@ impl LlmClient {
     }
 
     async fn call_api(&self, items: &[TranslationRequest<'_>]) -> Result<Vec<TranslationResult>> {
-        let content = serde_json::to_string(&BatchInput {
-            items: items
-                .iter()
-                .map(|item| BatchInputItem {
-                    id: item.id,
-                    text: item.text,
-                })
-                .collect(),
-        })
-        .context("failed to serialize translation batch request")?;
+        let content = serialize_batch_input(items)?;
 
         let req_body = ApiRequest {
             model: MODEL.to_string(),
@@ -203,6 +200,19 @@ impl LlmClient {
 
         parse_batch_response(&text, items)
     }
+}
+
+fn serialize_batch_input(items: &[TranslationRequest<'_>]) -> Result<String> {
+    serde_json::to_string(&BatchInput {
+        items: items
+            .iter()
+            .map(|item| BatchInputItem {
+                id: item.id,
+                text: item.text,
+            })
+            .collect(),
+    })
+    .context("failed to serialize translation batch request")
 }
 
 #[derive(Serialize)]

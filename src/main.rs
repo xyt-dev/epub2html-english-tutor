@@ -18,7 +18,7 @@ use indicatif::ProgressBar;
 use llm_client::{LlmClient, TranslationRequest};
 use parse_utils::ParseOptions;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -59,6 +59,13 @@ struct Args {
     count: bool,
 
     #[arg(
+        short,
+        long,
+        help = "Print full LLM request and response bodies to stderr"
+    )]
+    verbose: bool,
+
+    #[arg(
         long,
         default_value_t = 2,
         help = "Maximum number of concurrent translation requests"
@@ -71,6 +78,13 @@ struct Args {
         help = "Delay in milliseconds before launching each translation request"
     )]
     request_delay_ms: u64,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_CONTEXT_PARAGRAPHS,
+        help = "Number of preceding source paragraphs to include as context for each translation request"
+    )]
+    context_paragraphs: usize,
 
     #[arg(
         long,
@@ -121,6 +135,7 @@ struct JobOutcome {
 struct TranslationOptions {
     jobs: usize,
     request_delay: Duration,
+    context_paragraphs: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +146,8 @@ struct PendingParagraph {
 
 #[derive(Debug, Clone)]
 struct PendingBatch {
+    book_title: String,
+    context: Vec<PendingParagraph>,
     paragraphs: Vec<PendingParagraph>,
     metrics: BatchMetrics,
 }
@@ -186,15 +203,26 @@ struct ParagraphTaskResult {
 }
 
 #[derive(Debug)]
-struct TranslationTaskResult {
-    items: Vec<ParagraphTaskResult>,
-    metrics: BatchMetrics,
+enum TranslationTaskResult {
+    Completed {
+        items: Vec<ParagraphTaskResult>,
+        metrics: BatchMetrics,
+    },
+    RetryIndividually {
+        book_title: String,
+        context: Vec<PendingParagraph>,
+        paragraphs: Vec<PendingParagraph>,
+        metrics: BatchMetrics,
+        error: String,
+    },
 }
 
 const BATCH_TARGET_CHARS: usize = 5_000;
 const BATCH_HARD_MAX_CHARS: usize = 7_000;
 const BATCH_MAX_ITEMS: usize = 10;
 const SINGLE_PARAGRAPH_CHARS: usize = 2_800;
+const DEFAULT_CONTEXT_PARAGRAPHS: usize = 10;
+const MAX_CONTEXT_PARAGRAPHS: usize = 20;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -203,7 +231,7 @@ async fn main() -> Result<()> {
 
     let parse_options = parse_options_from_args(&args);
     if args.count {
-        return count_inputs(&args.input, &parse_options);
+        return count_inputs(&args.input, &parse_options, args.context_paragraphs);
     }
 
     std::fs::create_dir_all(&args.output_dir)?;
@@ -211,6 +239,7 @@ async fn main() -> Result<()> {
     let translation_options = TranslationOptions {
         jobs: args.jobs,
         request_delay: Duration::from_millis(args.request_delay_ms),
+        context_paragraphs: args.context_paragraphs,
     };
 
     ui::print_banner(&args.output_dir, args.rebuild);
@@ -219,11 +248,13 @@ async fn main() -> Result<()> {
         ui::print_kv(
             "llm",
             format!(
-                "{} job(s) · {}ms launch delay · adaptive batches target {} / max {} chars",
+                "{} job(s) · {}ms launch delay · context {} para(s) · adaptive batches target {} / max {} chars · max {} item(s)",
                 translation_options.jobs,
                 args.request_delay_ms,
+                translation_options.context_paragraphs,
                 BATCH_TARGET_CHARS,
-                BATCH_HARD_MAX_CHARS
+                BATCH_HARD_MAX_CHARS,
+                BATCH_MAX_ITEMS
             ),
         );
     }
@@ -245,6 +276,7 @@ async fn main() -> Result<()> {
         Some(LlmClient::new(
             std::env::var("ANTHROPIC_AUTH_TOKEN")
                 .context("ANTHROPIC_AUTH_TOKEN env var not set")?,
+            args.verbose,
         ))
     };
 
@@ -376,15 +408,20 @@ async fn process_input(
         format!("{} cached paragraph(s)", st.completed.len()),
     );
 
-    let pending: Vec<PendingParagraph> = book
+    let all_translatable: Vec<PendingParagraph> = book
         .chapters
         .iter()
         .flat_map(|c| c.paragraphs.iter())
-        .filter(|p| p.is_translatable() && !st.is_done(&p.id) && !p.text.trim().is_empty())
+        .filter(|p| p.is_translatable() && !p.text.trim().is_empty())
         .map(|p| PendingParagraph {
             para_id: p.id.clone(),
             para_text: p.text.clone(),
         })
+        .collect();
+    let pending: Vec<PendingParagraph> = all_translatable
+        .iter()
+        .filter(|p| !st.is_done(&p.para_id))
+        .cloned()
         .collect();
 
     let already_done = total_paragraphs.saturating_sub(pending.len());
@@ -409,7 +446,12 @@ async fn process_input(
     pb.enable_steady_tick(Duration::from_millis(80));
 
     let para_map = build_para_map(&book);
-    let pending_batches = build_translation_batches(pending);
+    let pending_batches = build_translation_batches(
+        book.title.as_str(),
+        pending,
+        &all_translatable,
+        translation_options.context_paragraphs,
+    );
     let pending_summary = summarize_batches(&pending_batches);
     ui::print_kv(
         "batching",
@@ -421,29 +463,68 @@ async fn process_input(
         ),
     );
     let mut join_set = JoinSet::new();
-    let mut pending_iter = pending_batches.into_iter();
+    let mut pending_queue = VecDeque::from(pending_batches);
     let mut launched_any = false;
 
     fill_translation_queue(
         &mut join_set,
-        &mut pending_iter,
+        &mut pending_queue,
         client,
         translation_options,
         &mut launched_any,
     )
     .await;
+    if !join_set.is_empty() {
+        pb.set_message(format!("active={} · waiting first batch", join_set.len()));
+    }
 
     while let Some(joined) = join_set.join_next().await {
         let task = joined.context("translation worker panicked")?;
-        let batch_metrics = task.metrics;
-        let batch_size = task.items.len();
-        let last_id = task
-            .items
+        let (items, batch_metrics) = match task {
+            TranslationTaskResult::Completed { items, metrics } => (items, metrics),
+            TranslationTaskResult::RetryIndividually {
+                book_title,
+                context,
+                paragraphs,
+                metrics,
+                error,
+            } => {
+                let batch_size = paragraphs.len();
+                push_individual_batches_front(
+                    &mut pending_queue,
+                    book_title,
+                    context,
+                    paragraphs,
+                    translation_options.context_paragraphs,
+                );
+                fill_translation_queue(
+                    &mut join_set,
+                    &mut pending_queue,
+                    client,
+                    translation_options,
+                    &mut launched_any,
+                )
+                .await;
+                pb.set_message(format!(
+                    "active={} · split batch={} · ~{} tokens",
+                    join_set.len(),
+                    batch_size,
+                    metrics.input_tokens_estimate
+                ));
+                pb.println(ui::warn_text(format!(
+                    "split batch of {} into single requests: {}",
+                    batch_size, error
+                )));
+                continue;
+            }
+        };
+        let batch_size = items.len();
+        let last_id = items
             .last()
             .map(|item| abbreviate_para_id(&item.para_id))
             .unwrap_or_else(|| "-".to_string());
 
-        for item in task.items {
+        for item in items {
             match item.outcome {
                 Ok(resp) => {
                     if let Some(para) = para_map.get(item.para_id.as_str()) {
@@ -463,7 +544,7 @@ async fn process_input(
 
         fill_translation_queue(
             &mut join_set,
-            &mut pending_iter,
+            &mut pending_queue,
             client,
             translation_options,
             &mut launched_any,
@@ -502,7 +583,11 @@ fn build_para_map<'a>(book: &'a types::Book) -> HashMap<&'a str, &'a types::Para
         .collect()
 }
 
-fn count_inputs(input_root: &Path, parse_options: &ParseOptions) -> Result<()> {
+fn count_inputs(
+    input_root: &Path,
+    parse_options: &ParseOptions,
+    context_paragraphs: usize,
+) -> Result<()> {
     let inputs = collect_inputs(input_root)?;
     ui::print_input_summary(input_root, inputs.len());
 
@@ -514,7 +599,7 @@ fn count_inputs(input_root: &Path, parse_options: &ParseOptions) -> Result<()> {
     for input_path in &inputs {
         match parser::parse_book(input_path, parse_options) {
             Ok(book) => {
-                let stats = count_book(&book);
+                let stats = count_book(&book, context_paragraphs);
                 let title = book.title;
                 succeeded += 1;
                 total.add(&stats);
@@ -714,7 +799,7 @@ fn format_count(value: usize) -> String {
     out
 }
 
-fn count_book(book: &types::Book) -> CountStats {
+fn count_book(book: &types::Book, context_paragraphs: usize) -> CountStats {
     let mut stats = CountStats {
         books: 1,
         chapters: book.chapters.len(),
@@ -739,7 +824,12 @@ fn count_book(book: &types::Book) -> CountStats {
         stats.english_words += count_english_words(&para.para_text);
     }
 
-    let batch_summary = summarize_batches(&build_translation_batches(pending));
+    let batch_summary = summarize_batches(&build_translation_batches(
+        book.title.as_str(),
+        pending.clone(),
+        &pending,
+        context_paragraphs,
+    ));
     stats.request_count = batch_summary.request_count;
     stats.input_tokens_estimate = batch_summary.input_tokens_estimate;
 
@@ -748,13 +838,13 @@ fn count_book(book: &types::Book) -> CountStats {
 
 async fn fill_translation_queue(
     join_set: &mut JoinSet<TranslationTaskResult>,
-    pending_iter: &mut std::vec::IntoIter<PendingBatch>,
+    pending_queue: &mut VecDeque<PendingBatch>,
     client: &LlmClient,
     options: &TranslationOptions,
     launched_any: &mut bool,
 ) {
     while join_set.len() < options.jobs {
-        let Some(job) = pending_iter.next() else {
+        let Some(job) = pending_queue.pop_front() else {
             break;
         };
 
@@ -765,6 +855,15 @@ async fn fill_translation_queue(
         let client = client.clone();
         join_set.spawn(async move {
             let metrics = job.metrics;
+            let book_title = job.book_title;
+            let context_items = job
+                .context
+                .iter()
+                .map(|paragraph| TranslationRequest {
+                    id: paragraph.para_id.as_str(),
+                    text: paragraph.para_text.as_str(),
+                })
+                .collect::<Vec<_>>();
             let request_items = job
                 .paragraphs
                 .iter()
@@ -774,57 +873,88 @@ async fn fill_translation_queue(
                 })
                 .collect::<Vec<_>>();
 
-            let items = match client.translate_batch(&request_items).await {
-                Ok(responses) => responses
-                    .into_iter()
-                    .map(|response| ParagraphTaskResult {
-                        para_id: response.id,
-                        outcome: Ok(response.response),
-                    })
-                    .collect(),
-                Err(batch_err) if job.paragraphs.len() > 1 => {
-                    eprintln!(
-                        "  [llm] batch of {} failed, retrying individually: {:#}",
-                        job.paragraphs.len(),
-                        batch_err
-                    );
-                    let mut fallback = Vec::with_capacity(job.paragraphs.len());
-                    for paragraph in job.paragraphs {
-                        let para_id = paragraph.para_id;
-                        let outcome = client
-                            .translate_paragraph(&para_id, &paragraph.para_text)
-                            .await
-                            .map_err(|err| format!("{:#}", err));
-                        fallback.push(ParagraphTaskResult { para_id, outcome });
-                    }
-                    fallback
+            match client
+                .translate_batch(book_title.as_str(), &context_items, &request_items)
+                .await
+            {
+                Ok(responses) => {
+                    let items = responses
+                        .into_iter()
+                        .map(|response| ParagraphTaskResult {
+                            para_id: response.id,
+                            outcome: Ok(response.response),
+                        })
+                        .collect();
+                    TranslationTaskResult::Completed { items, metrics }
                 }
-                Err(batch_err) => job
-                    .paragraphs
-                    .into_iter()
-                    .map(|paragraph| ParagraphTaskResult {
-                        para_id: paragraph.para_id,
-                        outcome: Err(format!("{:#}", batch_err)),
-                    })
-                    .collect(),
-            };
-
-            TranslationTaskResult { items, metrics }
+                Err(batch_err) if job.paragraphs.len() > 1 => {
+                    TranslationTaskResult::RetryIndividually {
+                        book_title,
+                        paragraphs: job.paragraphs,
+                        context: job.context,
+                        metrics,
+                        error: format!("{:#}", batch_err),
+                    }
+                }
+                Err(batch_err) => {
+                    let items = job
+                        .paragraphs
+                        .into_iter()
+                        .map(|paragraph| ParagraphTaskResult {
+                            para_id: paragraph.para_id,
+                            outcome: Err(format!("{:#}", batch_err)),
+                        })
+                        .collect();
+                    TranslationTaskResult::Completed { items, metrics }
+                }
+            }
         });
         *launched_any = true;
     }
 }
 
-fn build_translation_batches(pending: Vec<PendingParagraph>) -> Vec<PendingBatch> {
+fn push_individual_batches_front(
+    pending_queue: &mut VecDeque<PendingBatch>,
+    book_title: String,
+    context: Vec<PendingParagraph>,
+    paragraphs: Vec<PendingParagraph>,
+    context_paragraphs: usize,
+) {
+    let mut recent = context;
+    let mut batches = Vec::with_capacity(paragraphs.len());
+
+    for paragraph in paragraphs {
+        let batch_context = tail_context(&recent, context_paragraphs);
+        batches.push(make_pending_batch(
+            vec![paragraph.clone()],
+            batch_context,
+            book_title.as_str(),
+        ));
+        recent.push(paragraph);
+    }
+
+    for batch in batches.into_iter().rev() {
+        pending_queue.push_front(batch);
+    }
+}
+
+fn build_translation_batches(
+    book_title: &str,
+    pending: Vec<PendingParagraph>,
+    all_translatable: &[PendingParagraph],
+    context_paragraphs: usize,
+) -> Vec<PendingBatch> {
     let mut batches = Vec::new();
     let mut iter = pending.into_iter().peekable();
 
     while let Some(first) = iter.next() {
+        let batch_context =
+            context_for_batch(first.para_id.as_str(), all_translatable, context_paragraphs);
         let mut total_chars = token_estimator::effective_text_chars(&first.para_text);
         let mut paragraphs = vec![first];
 
         if total_chars > SINGLE_PARAGRAPH_CHARS {
-            batches.push(make_pending_batch(paragraphs));
+            batches.push(make_pending_batch(paragraphs, batch_context, book_title));
             continue;
         }
 
@@ -850,18 +980,52 @@ fn build_translation_batches(pending: Vec<PendingParagraph>) -> Vec<PendingBatch
             paragraphs.push(iter.next().unwrap());
         }
 
-        batches.push(make_pending_batch(paragraphs));
+        batches.push(make_pending_batch(paragraphs, batch_context, book_title));
     }
 
     batches
 }
 
-fn make_pending_batch(paragraphs: Vec<PendingParagraph>) -> PendingBatch {
-    let metrics = estimate_batch_metrics(&paragraphs);
+fn make_pending_batch(
+    paragraphs: Vec<PendingParagraph>,
+    context: Vec<PendingParagraph>,
+    book_title: &str,
+) -> PendingBatch {
+    let metrics = estimate_batch_metrics(book_title, &context, &paragraphs);
     PendingBatch {
+        book_title: book_title.to_string(),
+        context,
         paragraphs,
         metrics,
     }
+}
+
+fn context_for_batch(
+    first_para_id: &str,
+    all_translatable: &[PendingParagraph],
+    context_paragraphs: usize,
+) -> Vec<PendingParagraph> {
+    if context_paragraphs == 0 {
+        return Vec::new();
+    }
+
+    let Some(index) = all_translatable
+        .iter()
+        .position(|paragraph| paragraph.para_id == first_para_id)
+    else {
+        return Vec::new();
+    };
+    let start = index.saturating_sub(context_paragraphs);
+    all_translatable[start..index].to_vec()
+}
+
+fn tail_context(recent: &[PendingParagraph], context_paragraphs: usize) -> Vec<PendingParagraph> {
+    if context_paragraphs == 0 {
+        return Vec::new();
+    }
+
+    let start = recent.len().saturating_sub(context_paragraphs);
+    recent[start..].to_vec()
 }
 
 fn count_chinese_chars(text: &str) -> usize {
@@ -870,11 +1034,22 @@ fn count_chinese_chars(text: &str) -> usize {
         .count()
 }
 
-fn estimate_batch_metrics(paragraphs: &[PendingParagraph]) -> BatchMetrics {
+fn estimate_batch_metrics(
+    book_title: &str,
+    context: &[PendingParagraph],
+    paragraphs: &[PendingParagraph],
+) -> BatchMetrics {
     let effective_chars = paragraphs
         .iter()
         .map(|paragraph| token_estimator::effective_text_chars(&paragraph.para_text))
         .sum();
+    let context_items = context
+        .iter()
+        .map(|paragraph| TranslationRequest {
+            id: paragraph.para_id.as_str(),
+            text: paragraph.para_text.as_str(),
+        })
+        .collect::<Vec<_>>();
     let request_items = paragraphs
         .iter()
         .map(|paragraph| TranslationRequest {
@@ -882,7 +1057,8 @@ fn estimate_batch_metrics(paragraphs: &[PendingParagraph]) -> BatchMetrics {
             text: paragraph.para_text.as_str(),
         })
         .collect::<Vec<_>>();
-    let input_tokens_estimate = llm_client::estimate_translation_input_tokens(&request_items);
+    let input_tokens_estimate =
+        llm_client::estimate_translation_input_tokens(book_title, &context_items, &request_items);
 
     BatchMetrics {
         effective_chars,
@@ -928,6 +1104,12 @@ fn validate_args(args: &Args) -> Result<()> {
     }
     if !args.count && args.jobs > 16 {
         anyhow::bail!("--jobs must be 16 or smaller");
+    }
+    if args.context_paragraphs > MAX_CONTEXT_PARAGRAPHS {
+        anyhow::bail!(
+            "--context-paragraphs must be {} or smaller",
+            MAX_CONTEXT_PARAGRAPHS
+        );
     }
     if args.min_paragraph_chars == 0 {
         anyhow::bail!("--min-paragraph-chars must be at least 1");
@@ -984,15 +1166,47 @@ mod tests {
         }
     }
 
+    fn batches(pending: Vec<PendingParagraph>) -> Vec<PendingBatch> {
+        build_translation_batches(
+            "Sample Book",
+            pending.clone(),
+            &pending,
+            DEFAULT_CONTEXT_PARAGRAPHS,
+        )
+    }
+
     #[test]
     fn batching_respects_max_items_cap() {
-        let pending = (0..10)
+        let pending = (0..=BATCH_MAX_ITEMS)
             .map(|idx| pending(&format!("p{}", idx), 300))
             .collect::<Vec<_>>();
 
-        let batches = build_translation_batches(pending);
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].paragraphs.len(), 10);
+        let batches = batches(pending);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].paragraphs.len(), BATCH_MAX_ITEMS);
+        assert_eq!(batches[1].paragraphs.len(), 1);
+    }
+
+    #[test]
+    fn batching_includes_recent_source_context() {
+        let pending = (0..=BATCH_MAX_ITEMS)
+            .map(|idx| pending(&format!("p{}", idx), 300))
+            .collect::<Vec<_>>();
+
+        let batches = build_translation_batches("Sample Book", pending.clone(), &pending, 2);
+
+        assert!(batches[0].context.is_empty());
+        assert_eq!(
+            batches[1]
+                .context
+                .iter()
+                .map(|paragraph| paragraph.para_id.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("p{}", BATCH_MAX_ITEMS - 2),
+                format!("p{}", BATCH_MAX_ITEMS - 1)
+            ]
+        );
     }
 
     #[test]
@@ -1003,7 +1217,7 @@ mod tests {
             pending("p3", 300),
         ];
 
-        let batches = build_translation_batches(pending);
+        let batches = batches(pending);
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].paragraphs.len(), 2);
         assert_eq!(batches[1].paragraphs.len(), 1);
@@ -1015,7 +1229,7 @@ mod tests {
             .map(|idx| pending(&format!("p{}", idx), 2_400))
             .collect::<Vec<_>>();
 
-        let batches = build_translation_batches(pending);
+        let batches = batches(pending);
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].paragraphs.len(), 2);
         assert_eq!(batches[1].paragraphs.len(), 1);
@@ -1024,7 +1238,7 @@ mod tests {
     #[test]
     fn oversized_paragraphs_are_sent_alone() {
         let pending = vec![pending("p1", 2_900), pending("p2", 2_950)];
-        let batches = build_translation_batches(pending);
+        let batches = batches(pending);
 
         assert_eq!(batches.len(), 2);
         assert!(batches.iter().all(|batch| batch.paragraphs.len() == 1));
@@ -1073,7 +1287,7 @@ mod tests {
             }],
         };
 
-        let stats = count_book(&book);
+        let stats = count_book(&book, DEFAULT_CONTEXT_PARAGRAPHS);
         assert_eq!(stats.books, 1);
         assert_eq!(stats.chapters, 1);
         assert_eq!(stats.paragraphs, 1);
@@ -1086,7 +1300,7 @@ mod tests {
     #[test]
     fn batching_records_token_estimates() {
         let pending = vec![pending("p1", 300), pending("p2", 200)];
-        let batches = build_translation_batches(pending);
+        let batches = batches(pending);
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].metrics.effective_chars, 500);

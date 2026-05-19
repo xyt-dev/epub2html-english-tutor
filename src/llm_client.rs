@@ -3,12 +3,14 @@ use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use crate::types::LlmResponse;
 
 const API_VERSION: &str = "2023-06-01";
-const MODEL: &str = "claude-sonnet-4-6";
-const MAX_OUTPUT_TOKENS: u32 = 8_192;
+const MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
 
 fn api_url() -> String {
     let base = std::env::var("ANTHROPIC_BASE_URL")
@@ -35,6 +37,7 @@ struct ApiMessage {
 #[derive(Deserialize)]
 struct ApiResponse {
     content: Option<Vec<ContentBlock>>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +57,7 @@ Return exactly one JSON object with this schema:
   "items": [
     {
       "id": "<copy the input id exactly>",
-      "translation": "<中文翻译，自然流畅，保留原著风格>",
+      "translation": "<中文翻译，按轻小说中文本地化风格处理；不要逐字硬译，要根据上下文用中文重新说顺、说活。允许适度加戏：强化语气、节奏、吐槽、暧昧张力、画面感和文学意境，但不要改变剧情事实、人物关系或段落核心信息>",
       "vocabulary": [
         {
           "word": "<英文单词或词组>",
@@ -77,12 +80,14 @@ Return exactly one JSON object with this schema:
 
 Rules:
 1. Process every input item and copy each "id" exactly once.
-2. "translation": translate the full paragraph naturally and preserve the original tone.
+2. "translation": translate the full paragraph naturally and preserve the original tone; prefer expressive Chinese localization over literal wording, with tasteful embellishment when it improves voice, rhythm, humor, tension, or imagery.
 3. "vocabulary": pick 3-8 advanced words or phrases worth learning (about IELTS 6.5+, C1/C2). Skip common words.
 4. "chunks": pick 2-5 useful collocations, phrases, or sentence patterns worth learning.
 5. If a paragraph is too short or lacks rich material, keep "vocabulary" and "chunks" as [].
 6. Output valid JSON only. No markdown fences, no notes, no omitted ids.
 7. Every input "text" field is the complete paragraph. Never ask for more text.
+8. The "book.title" field identifies the source book and should guide title-specific terminology and tone.
+9. The optional "context" array contains earlier source paragraphs only for continuity, pronouns, tone, and terminology. Do not translate context items and do not include their ids in the output.
 "#;
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -99,9 +104,13 @@ pub struct TranslationResult {
     pub response: LlmResponse,
 }
 
-pub fn estimate_translation_input_tokens(items: &[TranslationRequest<'_>]) -> usize {
-    let content =
-        serialize_batch_input(items).expect("serializing translation batch input should not fail");
+pub fn estimate_translation_input_tokens(
+    book_title: &str,
+    context: &[TranslationRequest<'_>],
+    items: &[TranslationRequest<'_>],
+) -> usize {
+    let content = serialize_batch_input(book_title, context, items)
+        .expect("serializing translation batch input should not fail");
     crate::token_estimator::estimate_message_input_tokens(SYSTEM_PROMPT, &content)
 }
 
@@ -109,13 +118,18 @@ pub fn estimate_translation_input_tokens(items: &[TranslationRequest<'_>]) -> us
 pub struct LlmClient {
     client: Client,
     api_key: String,
+    verbose: bool,
 }
 
 impl LlmClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, verbose: bool) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(request_timeout())
+                .build()
+                .expect("failed to build HTTP client"),
             api_key,
+            verbose,
         }
     }
 
@@ -123,6 +137,8 @@ impl LlmClient {
     /// Retries up to 3 times on transient errors.
     pub async fn translate_batch(
         &self,
+        book_title: &str,
+        context: &[TranslationRequest<'_>],
         items: &[TranslationRequest<'_>],
     ) -> Result<Vec<TranslationResult>> {
         if items.is_empty() {
@@ -132,10 +148,14 @@ impl LlmClient {
         let mut last_err = anyhow::anyhow!("no attempts made");
 
         for attempt in 1..=3 {
-            match self.call_api(items).await {
+            match self.call_api(book_title, context, items).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    eprintln!("  [llm] attempt {}/3 failed: {}", attempt, e);
+                    let retryable = is_retryable_translation_error(&e);
+                    eprintln!("  [llm] attempt {}/3 failed: {:#}", attempt, e);
+                    if !retryable {
+                        return Err(e);
+                    }
                     last_err = e;
                     tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
                 }
@@ -144,31 +164,32 @@ impl LlmClient {
         Err(last_err)
     }
 
-    pub async fn translate_paragraph(&self, para_id: &str, text: &str) -> Result<LlmResponse> {
-        let request = [TranslationRequest { id: para_id, text }];
-        let mut results = self.translate_batch(&request).await?;
-        match results.len() {
-            1 => Ok(results.pop().unwrap().response),
-            count => bail!("expected 1 translation item, got {}", count),
-        }
-    }
-
-    async fn call_api(&self, items: &[TranslationRequest<'_>]) -> Result<Vec<TranslationResult>> {
-        let content = serialize_batch_input(items)?;
+    async fn call_api(
+        &self,
+        book_title: &str,
+        context: &[TranslationRequest<'_>],
+        items: &[TranslationRequest<'_>],
+    ) -> Result<Vec<TranslationResult>> {
+        let content = serialize_batch_input(book_title, context, items)?;
+        let max_tokens = max_output_tokens();
+        let url = api_url();
 
         let req_body = ApiRequest {
             model: MODEL.to_string(),
-            max_tokens: MAX_OUTPUT_TOKENS,
+            max_tokens,
             system: SYSTEM_PROMPT.to_string(),
             messages: vec![ApiMessage {
                 role: "user".to_string(),
                 content,
             }],
         };
+        if self.verbose {
+            print_verbose_request(&url, &req_body);
+        }
 
         let resp = self
             .client
-            .post(api_url())
+            .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
@@ -183,7 +204,13 @@ impl LlmClient {
             bail!("API error {}: {}", status, body);
         }
 
-        let api_resp: ApiResponse = resp.json().await.context("failed to parse API response")?;
+        let response_body = resp.text().await.context("failed to read API response")?;
+        if self.verbose {
+            print_verbose_response(status.as_u16(), &response_body);
+        }
+
+        let api_resp: ApiResponse =
+            serde_json::from_str(&response_body).context("failed to parse API response")?;
 
         let text = api_resp
             .content
@@ -198,12 +225,32 @@ impl LlmClient {
             bail!("API returned empty content (batch likely blocked by content filter)");
         }
 
+        if api_resp.stop_reason.as_deref() == Some("max_tokens") {
+            bail!(
+                "API stopped at max_tokens ({}) after {} response chars; batch JSON is likely truncated. Reduce batch size or raise ANTHROPIC_MAX_OUTPUT_TOKENS if the provider supports it.",
+                max_tokens,
+                text.len(),
+            );
+        }
+
         parse_batch_response(&text, items)
     }
 }
 
-fn serialize_batch_input(items: &[TranslationRequest<'_>]) -> Result<String> {
+fn serialize_batch_input(
+    book_title: &str,
+    context: &[TranslationRequest<'_>],
+    items: &[TranslationRequest<'_>],
+) -> Result<String> {
     serde_json::to_string(&BatchInput {
+        book: BatchBook { title: book_title },
+        context: context
+            .iter()
+            .map(|item| BatchInputItem {
+                id: item.id,
+                text: item.text,
+            })
+            .collect(),
         items: items
             .iter()
             .map(|item| BatchInputItem {
@@ -215,9 +262,56 @@ fn serialize_batch_input(items: &[TranslationRequest<'_>]) -> Result<String> {
     .context("failed to serialize translation batch request")
 }
 
+fn print_verbose_request(url: &str, req_body: &ApiRequest) {
+    let json_body = serde_json::to_string_pretty(req_body)
+        .unwrap_or_else(|err| format!("<failed to serialize request body: {}>", err));
+
+    eprintln!(
+        "\n========== LLM REQUEST ==========\nPOST {}\n{}\n========== END LLM REQUEST ==========\n",
+        url, json_body,
+    );
+}
+
+fn print_verbose_response(status: u16, response_body: &str) {
+    eprintln!(
+        "\n========== LLM RESPONSE ==========\nstatus: {}\n--- raw body ---\n{}\n========== END LLM RESPONSE ==========\n",
+        status, response_body
+    );
+}
+
+fn request_timeout() -> Duration {
+    std::env::var("ANTHROPIC_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
+}
+
+fn max_output_tokens() -> u32 {
+    std::env::var("ANTHROPIC_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|&tokens| tokens > 0)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+}
+
+fn is_retryable_translation_error(err: &anyhow::Error) -> bool {
+    let message = format!("{:#}", err);
+    !message.contains("API stopped at max_tokens")
+}
+
 #[derive(Serialize)]
 struct BatchInput<'a> {
+    book: BatchBook<'a>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    context: Vec<BatchInputItem<'a>>,
     items: Vec<BatchInputItem<'a>>,
+}
+
+#[derive(Serialize)]
+struct BatchBook<'a> {
+    title: &'a str,
 }
 
 #[derive(Serialize)]
@@ -244,17 +338,23 @@ fn parse_batch_response(
 ) -> Result<Vec<TranslationResult>> {
     let json_str = extract_json(raw);
 
-    let payload: BatchOutput = serde_json::from_str(&json_str).with_context(|| {
-        let json_preview = truncate_str(&json_str, 900);
-        let raw_preview = truncate_str(raw, 240);
-        format!(
-            "LLM returned invalid batch JSON.\nExtracted ({} chars):\n---\n{}\n---\nRaw ({} chars, first 240):\n---\n{}\n---",
-            json_str.len(),
-            json_preview,
-            raw.len(),
-            raw_preview,
-        )
-    })?;
+    let payload: BatchOutput = match serde_json::from_str(&json_str) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let json_head = truncate_str(&json_str, 900);
+            let json_tail = truncate_tail_str(&json_str, 900);
+            let raw_preview = truncate_str(raw, 240);
+            bail!(
+                "LLM returned invalid batch JSON: {}.\nExtracted ({} chars, first 900):\n---\n{}\n---\nExtracted tail (last 900):\n---\n{}\n---\nRaw ({} chars, first 240):\n---\n{}\n---",
+                err,
+                json_str.len(),
+                json_head,
+                json_tail,
+                raw.len(),
+                raw_preview,
+            );
+        }
+    };
 
     validate_batch_items(payload.items, expected)
 }
@@ -489,6 +589,18 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..boundary]
 }
 
+/// Keep the tail of a string without splitting a UTF-8 character.
+fn truncate_tail_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut boundary = s.len() - max_bytes;
+    while !s.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    &s[boundary..]
+}
+
 /// Strip ```json or ``` fences, using rfind for the closing fence so that a
 /// trailing newline after the closing ``` doesn't break the extraction.
 fn strip_code_fence(s: &str) -> &str {
@@ -574,5 +686,28 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "p1");
         assert_eq!(parsed[0].response.translation, "译文");
+    }
+
+    #[test]
+    fn serialized_batch_input_includes_book_title() {
+        let items = [TranslationRequest {
+            id: "p1",
+            text: "first",
+        }];
+
+        let raw = serialize_batch_input("Sample Book", &[], &items).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(value["book"]["title"], "Sample Book");
+        assert_eq!(value["items"][0]["id"], "p1");
+    }
+
+    #[test]
+    fn max_tokens_errors_are_not_retried_as_same_batch() {
+        let err = anyhow::anyhow!(
+            "API stopped at max_tokens after 7000 response chars; batch JSON is likely truncated"
+        );
+
+        assert!(!is_retryable_translation_error(&err));
     }
 }

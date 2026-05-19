@@ -19,6 +19,8 @@
 - Supports `--rebuild` to regenerate HTML from state files without API calls
 - Supports `--count` to count only text that would be sent to a third-party model, without API calls or output files
 - Supports `--jobs` for concurrent requests and `--request-delay-ms` for throttling
+- Supports `-v/--verbose` to print full LLM request and response contents in the terminal
+- Sends the book title with every translation request and supports `--context-paragraphs` for the previous N source paragraphs
 - Default batching strategy: target about `5000` effective chars, hard cap `7000`, max `10` paragraphs per request, with automatic single-paragraph fallback on batch failure
 - TXT / Markdown segmentation behavior can be tuned from the CLI
 - Generated HTML includes a chapter navigator, current-location badge, and paragraph-anchored resume
@@ -91,6 +93,7 @@ Notes:
 
 - `--jobs` controls concurrent batch requests, not concurrent single paragraphs
 - Each batch keeps contiguous paragraphs and tries to stay within `7000` effective characters
+- `--context-paragraphs` defaults to the previous `10` source paragraphs; set it to `0` to disable context
 
 ### 7. Count text before sending
 
@@ -135,10 +138,14 @@ Options:
           Rebuild HTML from existing state files without API calls
       --count
           Count translatable source text and exit without API calls or output files
+  -v, --verbose
+          Print full LLM request and response bodies to stderr
       --jobs <JOBS>
           Maximum number of concurrent translation requests [default: 2]
       --request-delay-ms <REQUEST_DELAY_MS>
           Delay in milliseconds before launching each translation request [default: 0]
+      --context-paragraphs <CONTEXT_PARAGRAPHS>
+          Number of preceding source paragraphs to include as context for each translation request [default: 10]
       --min-paragraph-chars <MIN_PARAGRAPH_CHARS>
           Minimum characters required for a text block without sentence punctuation [default: 2]
       --title-max-words <TITLE_MAX_WORDS>
@@ -282,6 +289,8 @@ The current implementation lives in [src/html_gen.rs](src/html_gen.rs).
 The translation stage does not send one paragraph per request by default. It sends small batches of contiguous paragraphs:
 
 - Each request sends an `items` array, where every item includes `id` and `text`
+- Each request sends `book.title` for book/volume-specific terminology and tone
+- Each request also sends a `context` array by default with the previous `10` source paragraphs for reference only
 - Claude must return an `items` array with the same `id` values
 - The program validates, reorders, and writes results back by `id`
 
@@ -291,7 +300,8 @@ Current defaults:
 - Hard per-batch cap: `7000` effective characters
 - Maximum per batch: `10` paragraphs
 - Single paragraph over `2800` effective characters: sent alone
-- Runtime output shows queued batch chars and estimated input tokens including the prompt / `items` wrapper
+- Context window: previous `10` source paragraphs, configurable with `--context-paragraphs N`
+- Runtime output shows queued batch chars and estimated input tokens including the prompt / `book` / `context` / `items` wrapper
 - Batch failure: automatically falls back to single-paragraph requests
 
 This keeps the system prompt cost lower, preserves local reading context, and still lets HTML / state updates stay deterministic.

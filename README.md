@@ -19,6 +19,8 @@
 - 支持 `--rebuild` 离线重建 HTML，不调用 API
 - 支持 `--count` 只统计会发送给第三方模型的有效文本，不调用 API、不写输出文件
 - 支持 `--jobs` 控制并发请求数，支持 `--request-delay-ms` 节流
+- 支持 `-v/--verbose` 在终端打印完整 LLM 请求和响应内容
+- 每批翻译都会附带书名，并支持 `--context-paragraphs` 附带前 N 段原文上下文
 - 默认批处理策略：目标约 `5000` 有效字符、硬上限 `7000`、每批最多 `10` 段，批失败会自动降级为逐段重试
 - TXT / Markdown 分段规则可通过 CLI 参数调节
 - 阅读 HTML 内置章节目录、当前位置提示和段落级恢复定位
@@ -91,6 +93,7 @@ cargo run --release -- --jobs 3 --request-delay-ms 250 ./books
 
 - `--jobs` 控制同时进行的批请求数，而不是单段请求数
 - 每个批次默认会尽量保持连续段落，并把有效字符数控制在 `7000` 以内
+- `--context-paragraphs` 默认带前 `10` 段原文作为上下文；设为 `0` 可关闭
 
 ### 7. 统计发送前文本量
 
@@ -135,10 +138,14 @@ Options:
           Rebuild HTML from existing state files without API calls
       --count
           Count translatable source text and exit without API calls or output files
+  -v, --verbose
+          Print full LLM request and response bodies to stderr
       --jobs <JOBS>
           Maximum number of concurrent translation requests [default: 2]
       --request-delay-ms <REQUEST_DELAY_MS>
           Delay in milliseconds before launching each translation request [default: 0]
+      --context-paragraphs <CONTEXT_PARAGRAPHS>
+          Number of preceding source paragraphs to include as context for each translation request [default: 10]
       --min-paragraph-chars <MIN_PARAGRAPH_CHARS>
           Minimum characters required for a text block without sentence punctuation [default: 2]
       --title-max-words <TITLE_MAX_WORDS>
@@ -282,6 +289,8 @@ output/
 翻译阶段默认不是“一段发一次请求”，而是“连续段落小批量请求”：
 
 - 每个请求会发送一个 `items` 数组，数组里每项都带 `id` 和 `text`
+- 每个请求都会发送 `book.title`，用于书名、卷名和整体语气参考
+- 每个请求默认还会带一个 `context` 数组，包含前 `10` 段原文，仅供上下文参考，不要求模型输出
 - Claude 必须返回同样带 `id` 的 `items` 数组
 - 本地会按 `id` 校验、重排并写回 HTML / `state.json`
 
@@ -291,7 +300,8 @@ output/
 - 单批硬上限：`7000` 个有效字符
 - 单批最多：`10` 段
 - 单段超过 `2800` 有效字符：单独发送
-- 运行时会显示待发送批次的有效字符数和包含 prompt / `items` 包装后的输入 token 估算
+- 上下文窗口：前 `10` 段原文，可用 `--context-paragraphs N` 调整
+- 运行时会显示待发送批次的有效字符数和包含 prompt / `book` / `context` / `items` 包装后的输入 token 估算
 - 批请求失败：自动回退为逐段请求
 
 这样做的目的是：

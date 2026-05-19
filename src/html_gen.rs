@@ -855,6 +855,7 @@ const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     const PROGRESS_MID_POINT = 0.35;
     let currentParaId = null;
     let rafPending = false;
+    let canSaveReadingPosition = false;
 
     function safeParse(raw, fallback) {
       if (!raw) return fallback;
@@ -1019,7 +1020,9 @@ const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
       tocLocInlineEl.textContent = locText;
       updateCurrentHighlight(current);
       updateChapterHighlight(chapterId);
-      saveReadingPosition(current);
+      if (canSaveReadingPosition) {
+        saveReadingPosition(current);
+      }
     }
 
     function scheduleReadingState() {
@@ -1047,12 +1050,14 @@ const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
 
     function restoreReadingPosition() {
       if (window.location.hash) {
+        canSaveReadingPosition = true;
         scheduleReadingState();
         return;
       }
 
       const saved = safeParse(localStorage.getItem(POSITION_KEY), null);
       if (!saved) {
+        canSaveReadingPosition = true;
         scheduleReadingState();
         return;
       }
@@ -1062,6 +1067,7 @@ const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         paraBlocks[Math.max(0, Number(saved.paraIndex || 1) - 1)];
 
       if (!target) {
+        canSaveReadingPosition = true;
         scheduleReadingState();
         return;
       }
@@ -1072,6 +1078,7 @@ const HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         target.offsetTop + Number(saved.withinParaOffset || 0) - viewportAnchor
       );
       window.scrollTo({ top, behavior: 'auto' });
+      canSaveReadingPosition = true;
       scheduleReadingState();
     }
 

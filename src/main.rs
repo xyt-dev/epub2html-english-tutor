@@ -219,7 +219,7 @@ enum TranslationTaskResult {
 
 const BATCH_TARGET_CHARS: usize = 5_000;
 const BATCH_HARD_MAX_CHARS: usize = 7_000;
-const BATCH_MAX_ITEMS: usize = 10;
+const BATCH_MAX_ITEMS: usize = 8;
 const SINGLE_PARAGRAPH_CHARS: usize = 2_800;
 const DEFAULT_CONTEXT_PARAGRAPHS: usize = 10;
 const MAX_CONTEXT_PARAGRAPHS: usize = 20;

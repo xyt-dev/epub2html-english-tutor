@@ -1,131 +1,37 @@
-//! Single source of truth for LLM provider configuration.
+//! Loads, merges, and validates LLM configuration.
 //!
-//! Non-secret settings (API format, model, base URL, thinking toggle, ...)
-//! live in one TOML file (default `llm.toml`). The API key itself is never
-//! stored in that file: it is always read from an environment variable,
-//! whose name is configurable via `api_key_env`.
+//! Precedence: CLI overrides > user config file > built-in defaults.
 //!
-//! Precedence: CLI overrides > config file > built-in defaults.
+//! The user config file normally lives in the platform config directory
+//! (see [`super::paths`]). The project's bundled `llm.toml` is only a
+//! human-readable template/example; it is never read by the running
+//! program. When no user config file exists, callers fall back to CLI
+//! overrides plus built-in defaults (see [`run_setup_wizard`] to create one
+//! interactively).
 
+use super::schema::{
+    ApiFormat, FileConfig, LlmConfig, LlmConfigOverrides, LlmSection, DEFAULT_JOBS,
+    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_THINKING_BUDGET_TOKENS,
+    MIN_THINKING_BUDGET_TOKENS,
+};
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 use std::path::Path;
 
-/// Wire format used to talk to the provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiFormat {
-    /// Anthropic Messages API (`/v1/messages`). Also spoken by most
-    /// Anthropic-compatible relay gateways (中转站).
-    Anthropic,
-    /// OpenAI Chat Completions API (`/chat/completions`). Also spoken by
-    /// DeepSeek's native API.
-    OpenAi,
-}
-
-impl ApiFormat {
-    fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "anthropic" => Ok(Self::Anthropic),
-            "openai" => Ok(Self::OpenAi),
-            other => bail!(
-                "unknown llm provider '{}': expected 'anthropic' or 'openai'",
-                other
-            ),
-        }
+fn read_section(path: &Path) -> Result<LlmSection> {
+    if !path.exists() {
+        return Ok(LlmSection::default());
     }
-
-    fn default_base_url(self) -> &'static str {
-        match self {
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::OpenAi => "https://api.deepseek.com",
-        }
-    }
-
-    fn default_api_key_env(self) -> &'static str {
-        match self {
-            Self::Anthropic => "ANTHROPIC_AUTH_TOKEN",
-            Self::OpenAi => "DEEPSEEK_API_KEY",
-        }
-    }
-
-    fn default_model(self) -> &'static str {
-        "deepseek-v4-flash"
-    }
-}
-
-impl std::fmt::Display for ApiFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Anthropic => "anthropic",
-            Self::OpenAi => "openai",
-        })
-    }
-}
-
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
-const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 4096;
-const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
-const DEFAULT_JOBS: usize = 2;
-
-/// Fully resolved configuration ready to build an [`crate::llm_client::LlmClient`] from.
-#[derive(Debug, Clone)]
-pub struct LlmConfig {
-    pub format: ApiFormat,
-    pub model: String,
-    pub base_url: String,
-    pub thinking: bool,
-    pub thinking_budget_tokens: u32,
-    pub max_output_tokens: u32,
-    pub request_timeout_secs: u64,
-    pub api_key: String,
-    pub jobs: usize,
-}
-
-/// Raw on-disk shape of the TOML file. Every field is optional so the file
-/// itself is optional and each field can be partially specified.
-#[derive(Debug, Default, Deserialize)]
-struct FileConfig {
-    #[serde(default)]
-    llm: LlmSection,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct LlmSection {
-    provider: Option<String>,
-    model: Option<String>,
-    base_url: Option<String>,
-    thinking: Option<bool>,
-    thinking_budget_tokens: Option<u32>,
-    api_key_env: Option<String>,
-    max_output_tokens: Option<u32>,
-    request_timeout_secs: Option<u64>,
-    jobs: Option<usize>,
-}
-
-/// CLI-provided overrides. `None` means "not specified, defer to the config
-/// file / built-in default".
-#[derive(Debug, Default, Clone)]
-pub struct LlmConfigOverrides {
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub base_url: Option<String>,
-    pub thinking: Option<bool>,
-    pub jobs: Option<usize>,
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read llm config '{}'", path.display()))?;
+    Ok(toml::from_str::<FileConfig>(&raw)
+        .with_context(|| format!("failed to parse llm config '{}'", path.display()))?
+        .llm)
 }
 
 /// Load `path` (if it exists), apply `overrides`, and resolve the API key
 /// from the environment, producing a fully resolved [`LlmConfig`].
 pub fn load_llm_config(path: &Path, overrides: &LlmConfigOverrides) -> Result<LlmConfig> {
-    let mut section = if path.exists() {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read llm config '{}'", path.display()))?;
-        toml::from_str::<FileConfig>(&raw)
-            .with_context(|| format!("failed to parse llm config '{}'", path.display()))?
-            .llm
-    } else {
-        LlmSection::default()
-    };
+    let mut section = read_section(path)?;
 
     if let Some(provider) = &overrides.provider {
         section.provider = Some(provider.clone());
@@ -155,7 +61,7 @@ pub fn load_llm_config(path: &Path, overrides: &LlmConfigOverrides) -> Result<Ll
         .unwrap_or_else(|| format.default_api_key_env().to_string());
     let api_key = std::env::var(&api_key_env).with_context(|| {
         format!(
-            "{} env var not set (configure a different variable via api_key_env in llm.toml)",
+            "{} env var not set (configure a different variable via api_key_env in the llm config)",
             api_key_env
         )
     })?;
@@ -255,12 +161,6 @@ mod tests {
         let path = std::env::temp_dir().join("llm_config_test_does_not_exist.toml");
         let _ = std::fs::remove_file(&path);
 
-        // default_api_key_env for Anthropic is ANTHROPIC_AUTH_TOKEN, so this
-        // will fail unless that's set; instead override provider explicitly
-        // isn't possible without api_key_env, so just check the parse path
-        // via an explicit anthropic provider override plus setting the real
-        // default env var name via a scoped guard is avoided — assert on the
-        // error message shape instead when the key env is absent.
         let result = load_llm_config(&path, &overrides);
         std::env::remove_var(env_name);
         // Either it fails because ANTHROPIC_AUTH_TOKEN isn't set in this

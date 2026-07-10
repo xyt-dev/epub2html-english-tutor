@@ -1,8 +1,8 @@
+mod config;
 mod epub_parser;
 mod fs_utils;
 mod html_gen;
 mod llm_client;
-mod llm_config;
 mod markdown_parser;
 mod parse_utils;
 mod parser;
@@ -31,14 +31,14 @@ use tokio::task::JoinSet;
     version,
     about = "Convert EPUB/Markdown/Text books into annotated HTML with AI translation.",
     long_about = None,
-    after_help = "Examples:\n  epub-reader ../Books\n  epub-reader novel.epub\n  epub-reader notes.md ./out\n  epub-reader --count ../Books\n  epub-reader --jobs 3 novel.epub\n  epub-reader --txt-hard-linebreaks notes.txt ./out\n  epub-reader --rebuild ../Books ./out"
+    after_help = "Examples:\n  epub-reader --setup\n  epub-reader ../Books\n  epub-reader novel.epub\n  epub-reader notes.md ./out\n  epub-reader --count ../Books\n  epub-reader --jobs 3 novel.epub\n  epub-reader --txt-hard-linebreaks notes.txt ./out\n  epub-reader --rebuild ../Books ./out"
 )]
 struct Args {
     #[arg(
         value_name = "INPUT",
-        help = "Input file or directory (.epub/.md/.markdown/.txt)"
+        help = "Input file or directory (.epub/.md/.markdown/.txt); required unless --setup is used"
     )]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     #[arg(
         value_name = "OUTPUT",
@@ -60,6 +60,12 @@ struct Args {
     count: bool,
 
     #[arg(
+        long,
+        help = "Run the interactive LLM setup wizard and exit"
+    )]
+    setup: bool,
+
+    #[arg(
         short,
         long,
         help = "Print full LLM request and response bodies to stderr"
@@ -69,7 +75,7 @@ struct Args {
     #[arg(
         long,
         value_name = "JOBS",
-        help = "Override concurrent translation requests from llm.toml"
+        help = "Override concurrent translation requests from the LLM config"
     )]
     jobs: Option<usize>,
 
@@ -125,43 +131,42 @@ struct Args {
     #[arg(
         long,
         value_name = "PATH",
-        default_value = "llm.toml",
-        help = "Path to the LLM provider config file"
+        help = "Path to the LLM provider config file (default: platform config dir, e.g. ~/.config/epub-reader/llm.toml)"
     )]
-    llm_config: PathBuf,
+    llm_config: Option<PathBuf>,
 
     #[arg(
         long,
         value_name = "PROVIDER",
-        help = "Override the LLM API format from llm.toml: 'anthropic' or 'openai'"
+        help = "Override the LLM API format from the LLM config: 'anthropic' or 'openai'"
     )]
     llm_provider: Option<String>,
 
     #[arg(
         long,
         value_name = "MODEL",
-        help = "Override the LLM model from llm.toml"
+        help = "Override the LLM model from the LLM config"
     )]
     llm_model: Option<String>,
 
     #[arg(
         long,
         value_name = "URL",
-        help = "Override the LLM API base URL from llm.toml"
+        help = "Override the LLM API base URL from the LLM config"
     )]
     llm_base_url: Option<String>,
 
     #[arg(
         long,
         action = ArgAction::SetTrue,
-        help = "Enable model thinking/reasoning mode (overrides llm.toml; default off)"
+        help = "Enable model thinking/reasoning mode (overrides the LLM config; default off)"
     )]
     llm_thinking: bool,
 
     #[arg(
         long,
         action = ArgAction::SetTrue,
-        help = "Disable model thinking/reasoning mode (overrides llm.toml)"
+        help = "Disable model thinking/reasoning mode (overrides the LLM config)"
     )]
     llm_no_thinking: bool,
 }
@@ -273,9 +278,19 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
+    if args.setup {
+        let config_path = resolve_config_path(&args)?;
+        return config::run_setup_wizard(&config_path);
+    }
+
+    let input_root = args
+        .input
+        .clone()
+        .context("the INPUT argument is required unless --setup is used")?;
+
     let parse_options = parse_options_from_args(&args);
     if args.count {
-        return count_inputs(&args.input, &parse_options, args.context_paragraphs);
+        return count_inputs(&input_root, &parse_options, args.context_paragraphs);
     }
 
     std::fs::create_dir_all(&args.output_dir)?;
@@ -283,16 +298,16 @@ async fn main() -> Result<()> {
     ui::print_banner(&args.output_dir, args.rebuild);
     ui::print_kv("parse-rules", parse_options.summary());
 
-    let inputs = collect_inputs(&args.input)?;
+    let inputs = collect_inputs(&input_root)?;
     if inputs.is_empty() {
         ui::print_error(format!(
             "No supported input files ({}) found under {}",
             parser::supported_extensions_summary(),
-            args.input.display()
+            input_root.display()
         ));
         return Ok(());
     }
-    ui::print_input_summary(&args.input, inputs.len());
+    ui::print_input_summary(&input_root, inputs.len());
 
     let (client, translation_options) = if args.rebuild {
         (None, None)
@@ -304,16 +319,22 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let overrides = llm_config::LlmConfigOverrides {
+        let overrides = config::LlmConfigOverrides {
             provider: args.llm_provider.clone(),
             model: args.llm_model.clone(),
             base_url: args.llm_base_url.clone(),
             thinking: thinking_override,
             jobs: args.jobs,
         };
-        let config = llm_config::load_llm_config(&args.llm_config, &overrides)?;
+        let config_path = resolve_config_path(&args)?;
+        let llm_config = config::load_llm_config(&config_path, &overrides).with_context(|| {
+            format!(
+                "failed to load LLM config from '{}' (run with --setup to create one)",
+                config_path.display()
+            )
+        })?;
         let translation_options = TranslationOptions {
-            jobs: config.jobs,
+            jobs: llm_config.jobs,
             request_delay: Duration::from_millis(args.request_delay_ms),
             context_paragraphs: args.context_paragraphs,
         };
@@ -333,11 +354,11 @@ async fn main() -> Result<()> {
             "llm-provider",
             format!(
                 "{} · model={} · thinking={} · base_url={}",
-                config.format, config.model, config.thinking, config.base_url
+                llm_config.format, llm_config.model, llm_config.thinking, llm_config.base_url
             ),
         );
         (
-            Some(LlmClient::new(config, args.verbose)),
+            Some(LlmClient::new(llm_config, args.verbose)),
             Some(translation_options),
         )
     };
@@ -1158,6 +1179,12 @@ fn parse_options_from_args(args: &Args) -> ParseOptions {
 }
 
 fn validate_args(args: &Args) -> Result<()> {
+    if args.setup && (args.count || args.rebuild) {
+        anyhow::bail!("--setup cannot be used together with --count or --rebuild");
+    }
+    if !args.setup && args.input.is_none() {
+        anyhow::bail!("the INPUT argument is required unless --setup is used");
+    }
     if args.count && args.rebuild {
         anyhow::bail!("--count cannot be used together with --rebuild");
     }
@@ -1183,6 +1210,15 @@ fn validate_args(args: &Args) -> Result<()> {
         anyhow::bail!("--heading-max-words must be at least 1");
     }
     Ok(())
+}
+
+/// Resolves the effective LLM config file path: an explicit `--llm-config`
+/// override, or the platform-standard config directory otherwise.
+fn resolve_config_path(args: &Args) -> Result<PathBuf> {
+    match &args.llm_config {
+        Some(path) => Ok(path.clone()),
+        None => config::default_config_path(),
+    }
 }
 
 fn abbreviate_para_id(para_id: &str) -> String {

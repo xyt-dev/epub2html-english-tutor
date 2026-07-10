@@ -35,8 +35,12 @@
 # 安装 Rust（若未安装）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# LLM 相关设置统一放在 llm.toml（provider/model/base_url/thinking），API Key 只走环境变量
-# 参考仓库自带的 llm.toml，按需修改后设置对应的环境变量，例如：
+# LLM 相关设置（provider/model/base_url/thinking）统一放在平台标准配置目录下的
+# llm.toml 中（如 ~/.config/epub-reader/llm.toml），项目目录里的 llm.toml 只是
+# 一份可读模板，程序运行时不会读取它。首次使用建议跑一遍交互式配置向导：
+cargo run --release -- --setup
+# 向导只问常用字段（provider/model/base_url/api_key_env/thinking/jobs），
+# 写完后按提示设置对应的环境变量，例如：
 export ANTHROPIC_AUTH_TOKEN="sk-ant-..."   # provider = "anthropic" 时
 # export DEEPSEEK_API_KEY="sk-..."        # provider = "openai" 时（DeepSeek 原生 API）
 ```
@@ -90,7 +94,7 @@ cargo run --release -- --jobs 3 --request-delay-ms 250 ./books
 
 说明：
 
-- `--jobs` 控制同时进行的批请求数，而不是单段请求数；也可以写进 `llm.toml` 的 `jobs`
+- `--jobs` 控制同时进行的批请求数，而不是单段请求数；也可以写进 llm.toml 的 `jobs`
 - 并发只影响吞吐，不影响每批附带的原文上下文；上下文始终按原文位置切片
 - 每个批次默认会尽量保持连续段落，并把有效字符数控制在 `7000` 以内
 - `--context-paragraphs` 默认带前 `10` 段原文作为上下文；设为 `0` 可关闭
@@ -381,7 +385,7 @@ src/
 ├── markdown_parser.rs # Markdown 解析
 ├── text_parser.rs     # TXT 解析
 ├── html_gen.rs        # HTML 生成与段落 patch
-├── llm_config.rs      # llm.toml 配置读取与合并（provider/model/base_url/thinking）
+├── config/            # LLM 配置：路径解析、schema、加载合并、交互式向导
 ├── llm_client.rs      # Anthropic / OpenAI 兼容客户端
 ├── state.rs           # state.json 读写
 ├── fs_utils.rs        # 原子写文件
@@ -391,7 +395,21 @@ src/
 
 ## LLM 配置
 
-模型相关设置统一放在 `llm.toml`（默认路径，可用 `--llm-config` 指定别的文件）：
+配置文件不在项目目录里，而是放在平台标准配置目录下（可用 `--llm-config` 指定别的路径）：
+
+- Linux: `$XDG_CONFIG_HOME/epub-reader/llm.toml`（未设置时为 `~/.config/epub-reader/llm.toml`）
+- macOS: `~/Library/Application Support/epub-reader/llm.toml`
+- Windows: `%APPDATA%\epub-reader\llm.toml`
+
+项目目录里的 `llm.toml` 只是一份带注释的模板/示例，程序运行时从不读取它。
+
+最简单的配置方式是跑一遍交互式向导，它只问常用字段，写完直接生效：
+
+```bash
+cargo run --release -- --setup
+```
+
+配置文件也可以手写，格式如下：
 
 ```toml
 [llm]
@@ -403,19 +421,19 @@ thinking = false              # 默认关闭；DeepSeek/Claude 均支持开启
 # api_key_env = "ANTHROPIC_AUTH_TOKEN"
 # max_output_tokens = 8192
 # request_timeout_secs = 180
+jobs = 2
 ```
 
 - `provider = "anthropic"`：走 Anthropic Messages API（`/v1/messages`），兼容官方地址和各类中转站
 - `provider = "openai"`：走 OpenAI Chat Completions 格式（`/chat/completions`），兼容 DeepSeek 官方 API
 - API Key 永远只从环境变量读取，变量名由 `api_key_env` 指定（默认 `anthropic` 对应 `ANTHROPIC_AUTH_TOKEN`，`openai` 对应 `DEEPSEEK_API_KEY`），不会写进配置文件
-- CLI 参数会覆盖 `llm.toml`：`--llm-provider` `--llm-model` `--llm-base-url` `--llm-thinking` / `--llm-no-thinking`
+- 优先级：CLI 参数 > 配置文件 > 内置默认值。CLI 覆盖项：`--llm-provider` `--llm-model` `--llm-base-url` `--llm-thinking` / `--llm-no-thinking` `--jobs`
 - `thinking` 默认关闭；`--llm-thinking` 和 `--llm-no-thinking` 不能同时使用
-
-- `jobs` 可写在 `llm.toml` 中作为默认并发数，CLI 的 `--jobs` 会覆盖它
+- 没有配置文件时，程序会退回到 CLI 参数 + 内置默认值运行；跑 `--setup` 即可交互式创建一份
 
 ## 注意事项
 
-- API Key 只在正常翻译模式下需要（走 `llm.toml` 里 `api_key_env` 指定的环境变量）；`--rebuild` 不需要
+- API Key 只在正常翻译模式下需要（走配置文件里 `api_key_env` 指定的环境变量）；`--rebuild` 不需要
 - 如果你修改了原始输入文件，段落 ID 可能变化，旧 state 可能无法完全复用
 - `--jobs` 可以设得很高，也不会改变翻译上下文；但是否值得调高取决于你的 provider 并发 / RPM / TPM 限额，以及本次任务总批次数
 - 对排版特别碎的 TXT，建议试试：

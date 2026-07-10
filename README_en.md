@@ -35,9 +35,13 @@
 # Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# LLM settings (provider/model/base_url/thinking) live in llm.toml; the API
-# key itself always comes from an environment variable.
-# Check the bundled llm.toml, adjust it, then set the matching env var, e.g.:
+# LLM settings (provider/model/base_url/thinking) live in llm.toml inside the
+# platform-standard config directory (e.g. ~/.config/epub-reader/llm.toml on
+# Linux). The project's own llm.toml is just a commented template; it is
+# never read at runtime. Easiest way to set things up:
+cargo run --release -- --setup
+# The wizard only asks about the common fields (provider/model/base_url/
+# api_key_env/thinking/jobs), then tells you which env var to set, e.g.:
 export ANTHROPIC_AUTH_TOKEN="sk-ant-..."   # when provider = "anthropic"
 # export DEEPSEEK_API_KEY="sk-..."        # when provider = "openai" (DeepSeek native API)
 ```
@@ -91,7 +95,7 @@ cargo run --release -- --jobs 3 --request-delay-ms 250 ./books
 
 Notes:
 
-- `--jobs` controls concurrent batch requests, not concurrent single paragraphs; you can also set a default `jobs` value in `llm.toml`
+- `--jobs` controls concurrent batch requests, not concurrent single paragraphs; you can also set a default `jobs` value in the LLM config
 - Concurrency affects throughput only, not the source context attached to each batch; context is always sliced from fixed source positions
 - Each batch keeps contiguous paragraphs and tries to stay within `7000` effective characters
 - `--context-paragraphs` defaults to the previous `10` source paragraphs; set it to `0` to disable context
@@ -378,7 +382,7 @@ src/
 ├── markdown_parser.rs # Markdown parsing
 ├── text_parser.rs     # TXT parsing
 ├── html_gen.rs        # HTML generation and paragraph patching
-├── llm_config.rs      # llm.toml loading and merging (provider/model/base_url/thinking)
+├── config/            # LLM config: path resolution, schema, load/merge, setup wizard
 ├── llm_client.rs      # Anthropic / OpenAI-compatible client
 ├── state.rs           # state.json read/write
 ├── fs_utils.rs        # Atomic file writing
@@ -388,7 +392,22 @@ src/
 
 ## LLM Configuration
 
-All model settings live in `llm.toml` (default path; use `--llm-config` to point elsewhere):
+The config file does not live in the project directory; it lives in the
+platform-standard config directory instead (override with `--llm-config`):
+
+- Linux: `$XDG_CONFIG_HOME/epub-reader/llm.toml` (falls back to `~/.config/epub-reader/llm.toml`)
+- macOS: `~/Library/Application Support/epub-reader/llm.toml`
+- Windows: `%APPDATA%\epub-reader\llm.toml`
+
+The project's own `llm.toml` is just a commented template/example; the running program never reads it.
+
+Easiest way to configure: run the interactive wizard, which only asks about the common fields and writes the result immediately:
+
+```bash
+cargo run --release -- --setup
+```
+
+The file can also be hand-written:
 
 ```toml
 [llm]
@@ -400,19 +419,19 @@ thinking = false              # off by default; both DeepSeek and Claude support
 # api_key_env = "ANTHROPIC_AUTH_TOKEN"
 # max_output_tokens = 8192
 # request_timeout_secs = 180
+jobs = 2
 ```
 
 - `provider = "anthropic"`: speaks the Anthropic Messages API (`/v1/messages`), compatible with the official endpoint and relay gateways
 - `provider = "openai"`: speaks the OpenAI Chat Completions format (`/chat/completions`), compatible with DeepSeek's native API
 - The API key always comes from an environment variable, named by `api_key_env` (defaults to `ANTHROPIC_AUTH_TOKEN` for `anthropic`, `DEEPSEEK_API_KEY` for `openai`); it is never written to the config file
-- CLI flags override `llm.toml`: `--llm-provider`, `--llm-model`, `--llm-base-url`, `--llm-thinking` / `--llm-no-thinking`
+- Precedence: CLI overrides > config file > built-in defaults. CLI overrides: `--llm-provider`, `--llm-model`, `--llm-base-url`, `--llm-thinking` / `--llm-no-thinking`, `--jobs`
 - `thinking` is off by default; `--llm-thinking` and `--llm-no-thinking` cannot be used together
-
-- `jobs` can be set in `llm.toml` as the default concurrency; CLI `--jobs` overrides it
+- With no config file present, the program falls back to CLI flags plus built-in defaults; run `--setup` to create one interactively
 
 ## Notes
 
-- An API key is only required in translation mode, via the environment variable named in `llm.toml`'s `api_key_env`; `--rebuild` does not need one
+- An API key is only required in translation mode, via the environment variable named by the config file's `api_key_env`; `--rebuild` does not need one
 - If you modify the source input after starting a run, paragraph IDs may change and old state may no longer align perfectly
 - `--jobs` can be set very high without changing translation context, but whether that helps depends on your provider's concurrency / RPM / TPM limits and on how many batches the current job actually has
 - For messy TXT input, try:

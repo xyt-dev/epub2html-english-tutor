@@ -6,16 +6,17 @@
 
 ### Added
 
-- 新增统一的 LLM 配置文件 `llm.toml`，集中管理 provider / model / base_url / thinking 等非敏感设置；API Key 始终只从环境变量读取（变量名可通过 `api_key_env` 自定义），永不写入配置文件。
-- 新增 `src/llm_config.rs`：负责加载、合并、校验 `llm.toml`，优先级为 CLI 参数 > 配置文件 > 内置默认值。
+- 新增平台标准配置目录下的 LLM 配置文件（如 `~/.config/epub-reader/llm.toml`），集中管理 provider / model / base_url / thinking / jobs 等非敏感设置；API Key 始终只从环境变量读取（变量名可通过 `api_key_env` 自定义），永不写入配置文件。项目目录里的 `llm.toml` 仅作为带注释的模板/示例，程序运行时从不读取它。
+- 新增 `src/config/` 模块（`paths` / `schema` / `loader` / `wizard`），负责平台配置目录解析、加载、合并、校验 LLM 配置，优先级为 CLI 参数 > 配置文件 > 内置默认值；无配置文件时退回到 CLI 参数 + 内置默认值运行。
+- 新增 `--setup` 交互式配置向导（基于 `dialoguer`），只问常用字段（provider / model / base_url / api_key_env / thinking / jobs），写完直接生效，无需手动编辑 TOML。
 - `llm_client.rs` 重写为多格式客户端，支持两种协议：
   - `anthropic`：Anthropic Messages API（`/v1/messages`），兼容官方地址及各类中转站
   - `openai`：OpenAI Chat Completions 格式（`/chat/completions`），兼容 DeepSeek 官方 API
 - 新增模型 thinking（推理）模式开关，默认关闭：
-  - `llm.toml` 中的 `thinking` 字段
+  - 配置文件中的 `thinking` 字段
   - CLI 参数 `--llm-thinking` / `--llm-no-thinking`（互斥，覆盖配置文件）
   - Anthropic 格式通过 `thinking.budget_tokens` 控制推理预算；OpenAI/DeepSeek 格式通过 `thinking.type` 开关
-- 新增 CLI 参数：`--llm-config`（配置文件路径）、`--llm-provider`、`--llm-model`、`--llm-base-url`，用于临时覆盖 `llm.toml` 中的对应设置。
+- 新增 CLI 参数：`--llm-config`（配置文件路径覆盖）、`--llm-provider`、`--llm-model`、`--llm-base-url`，用于临时覆盖配置文件中的对应设置。
 - 运行时打印 `llm-provider` 状态行，显示实际生效的 provider / model / thinking / base_url，便于确认配置是否按预期加载。
 - 使用 `wiremock` 新增 5 个覆盖真实 HTTP 往返的重试集成测试：
   - 5xx / 503 瞬时错误后重试成功
@@ -23,7 +24,7 @@
   - 连续 3 次非法 JSON 后正确放弃并报错
   - `max_tokens` 截断错误不重试（避免同样输入长度的无意义重试）
   - OpenAI 格式下的重试路径
-- 新增 `llm_config.rs` 的 6 个单元测试，覆盖默认值解析、文件读取、CLI 覆盖优先级、thinking 默认关闭、budget 校验、非法 provider 报错。
+- 新增 `src/config/` 模块的单元测试，覆盖默认值解析、文件读取、CLI 覆盖优先级、thinking 默认关闭、budget 校验、非法 provider 报错。
 
 ### Changed
 

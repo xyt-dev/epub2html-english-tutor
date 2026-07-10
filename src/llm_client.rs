@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::llm_config::{ApiFormat, LlmConfig};
+use crate::config::{ApiFormat, LlmConfig};
 use crate::types::LlmResponse;
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -51,8 +51,8 @@ Return exactly one JSON object with this schema:
 Rules:
 1. Process every input item and copy each "id" exactly once.
 2. "translation": translate the full paragraph naturally and preserve the original tone; prefer expressive Chinese localization over literal wording, with tasteful embellishment when it improves voice, rhythm, humor, tension, or imagery.
-3. "vocabulary": pick 3-8 advanced words or phrases worth learning (about IELTS 6.5+, C1/C2). Skip common words.
-4. "chunks": pick 2-5 useful collocations, phrases, or sentence patterns worth learning.
+3. "vocabulary": pick 0-10 advanced words or phrases worth learning (about IELTS 6.5+, C1/C2). Skip common words.
+4. "chunks": pick 0-10 useful collocations, phrases, or sentence patterns worth learning.
 5. If a paragraph is too short or lacks rich material, keep "vocabulary" and "chunks" as [].
 6. Output valid JSON only. No markdown fences, no notes, no omitted ids.
 7. Every input "text" field is the complete paragraph. Never ask for more text.
@@ -123,7 +123,15 @@ impl LlmClient {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
                     let retryable = is_retryable_translation_error(&e);
-                    eprintln!("  [llm] attempt {}/3 failed: {:#}", attempt, e);
+                    if self.verbose {
+                        eprintln!("  [llm] attempt {}/3 failed: {:#}", attempt, e);
+                    } else {
+                        eprintln!(
+                            "  [llm] attempt {}/3 failed: {} (rerun with --verbose for the full response dump)",
+                            attempt,
+                            first_line(&format!("{:#}", e))
+                        );
+                    }
                     if !retryable {
                         return Err(e);
                     }
@@ -359,6 +367,12 @@ fn print_verbose_response(status: u16, response_body: &str) {
 fn is_retryable_translation_error(err: &anyhow::Error) -> bool {
     let message = format!("{:#}", err);
     !message.contains("API stopped at max_tokens")
+}
+
+/// First line of a (possibly multi-line) error message, for concise
+/// non-verbose logging.
+fn first_line(message: &str) -> &str {
+    message.split('\n').next().unwrap_or(message)
 }
 
 #[derive(serde::Serialize)]

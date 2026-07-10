@@ -14,7 +14,7 @@
 provider = "openai"
 
 # Model name sent to the provider.
-model = "deepseek-v4-flash"
+model = "deepseek-v4-pro"
 
 # API base URL. Defaults depend on `provider` when omitted:
 # - anthropic -> https://api.anthropic.com
@@ -43,4 +43,4 @@ thinking = false
 # Maximum concurrent translation requests. This controls how many batch API
 # calls can be in flight at once. Higher values do not change the source
 # context attached to each request; they only affect throughput.
-jobs = 2
+jobs = 10

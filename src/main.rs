@@ -2,6 +2,7 @@ mod epub_parser;
 mod fs_utils;
 mod html_gen;
 mod llm_client;
+mod llm_config;
 mod markdown_parser;
 mod parse_utils;
 mod parser;
@@ -67,10 +68,10 @@ struct Args {
 
     #[arg(
         long,
-        default_value_t = 2,
-        help = "Maximum number of concurrent translation requests"
+        value_name = "JOBS",
+        help = "Override concurrent translation requests from llm.toml"
     )]
-    jobs: usize,
+    jobs: Option<usize>,
 
     #[arg(
         long,
@@ -120,6 +121,49 @@ struct Args {
         help = "In .txt files, do not start a new paragraph after sentence-ending punctuation"
     )]
     txt_split_on_sentence_end: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "llm.toml",
+        help = "Path to the LLM provider config file"
+    )]
+    llm_config: PathBuf,
+
+    #[arg(
+        long,
+        value_name = "PROVIDER",
+        help = "Override the LLM API format from llm.toml: 'anthropic' or 'openai'"
+    )]
+    llm_provider: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "MODEL",
+        help = "Override the LLM model from llm.toml"
+    )]
+    llm_model: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Override the LLM API base URL from llm.toml"
+    )]
+    llm_base_url: Option<String>,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Enable model thinking/reasoning mode (overrides llm.toml; default off)"
+    )]
+    llm_thinking: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Disable model thinking/reasoning mode (overrides llm.toml)"
+    )]
+    llm_no_thinking: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -236,28 +280,8 @@ async fn main() -> Result<()> {
 
     std::fs::create_dir_all(&args.output_dir)?;
 
-    let translation_options = TranslationOptions {
-        jobs: args.jobs,
-        request_delay: Duration::from_millis(args.request_delay_ms),
-        context_paragraphs: args.context_paragraphs,
-    };
-
     ui::print_banner(&args.output_dir, args.rebuild);
     ui::print_kv("parse-rules", parse_options.summary());
-    if !args.rebuild {
-        ui::print_kv(
-            "llm",
-            format!(
-                "{} job(s) · {}ms launch delay · context {} para(s) · adaptive batches target {} / max {} chars · max {} item(s)",
-                translation_options.jobs,
-                args.request_delay_ms,
-                translation_options.context_paragraphs,
-                BATCH_TARGET_CHARS,
-                BATCH_HARD_MAX_CHARS,
-                BATCH_MAX_ITEMS
-            ),
-        );
-    }
 
     let inputs = collect_inputs(&args.input)?;
     if inputs.is_empty() {
@@ -270,14 +294,52 @@ async fn main() -> Result<()> {
     }
     ui::print_input_summary(&args.input, inputs.len());
 
-    let client = if args.rebuild {
-        None
+    let (client, translation_options) = if args.rebuild {
+        (None, None)
     } else {
-        Some(LlmClient::new(
-            std::env::var("ANTHROPIC_AUTH_TOKEN")
-                .context("ANTHROPIC_AUTH_TOKEN env var not set")?,
-            args.verbose,
-        ))
+        let thinking_override = if args.llm_thinking {
+            Some(true)
+        } else if args.llm_no_thinking {
+            Some(false)
+        } else {
+            None
+        };
+        let overrides = llm_config::LlmConfigOverrides {
+            provider: args.llm_provider.clone(),
+            model: args.llm_model.clone(),
+            base_url: args.llm_base_url.clone(),
+            thinking: thinking_override,
+            jobs: args.jobs,
+        };
+        let config = llm_config::load_llm_config(&args.llm_config, &overrides)?;
+        let translation_options = TranslationOptions {
+            jobs: config.jobs,
+            request_delay: Duration::from_millis(args.request_delay_ms),
+            context_paragraphs: args.context_paragraphs,
+        };
+        ui::print_kv(
+            "llm",
+            format!(
+                "{} job(s) · {}ms launch delay · context {} para(s) · adaptive batches target {} / max {} chars · max {} item(s)",
+                translation_options.jobs,
+                args.request_delay_ms,
+                translation_options.context_paragraphs,
+                BATCH_TARGET_CHARS,
+                BATCH_HARD_MAX_CHARS,
+                BATCH_MAX_ITEMS
+            ),
+        );
+        ui::print_kv(
+            "llm-provider",
+            format!(
+                "{} · model={} · thinking={} · base_url={}",
+                config.format, config.model, config.thinking, config.base_url
+            ),
+        );
+        (
+            Some(LlmClient::new(config, args.verbose)),
+            Some(translation_options),
+        )
     };
 
     let mut succeeded = 0usize;
@@ -294,7 +356,7 @@ async fn main() -> Result<()> {
                 &args.output_dir,
                 client.as_ref().unwrap(),
                 &parse_options,
-                &translation_options,
+                translation_options.as_ref().unwrap(),
             )
             .await
         };
@@ -574,7 +636,7 @@ async fn process_input(
     })
 }
 
-fn build_para_map<'a>(book: &'a types::Book) -> HashMap<&'a str, &'a types::Paragraph> {
+fn build_para_map(book: &types::Book) -> HashMap<&str, &types::Paragraph> {
     book.chapters
         .iter()
         .flat_map(|c| c.paragraphs.iter())
@@ -789,7 +851,7 @@ fn format_count(value: usize) -> String {
     for (idx, ch) in raw.chars().enumerate() {
         if idx > 0
             && (idx == first_group_len
-                || (idx > first_group_len && (idx - first_group_len) % 3 == 0))
+                || (idx > first_group_len && (idx - first_group_len).is_multiple_of(3)))
         {
             out.push(',');
         }
@@ -1099,11 +1161,11 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.count && args.rebuild {
         anyhow::bail!("--count cannot be used together with --rebuild");
     }
-    if !args.count && args.jobs == 0 {
-        anyhow::bail!("--jobs must be at least 1");
+    if args.llm_thinking && args.llm_no_thinking {
+        anyhow::bail!("--llm-thinking and --llm-no-thinking cannot be used together");
     }
-    if !args.count && args.jobs > 16 {
-        anyhow::bail!("--jobs must be 16 or smaller");
+    if !args.count && args.jobs == Some(0) {
+        anyhow::bail!("--jobs must be at least 1");
     }
     if args.context_paragraphs > MAX_CONTEXT_PARAGRAPHS {
         anyhow::bail!(
@@ -1153,6 +1215,19 @@ fn collect_inputs(path: &Path) -> Result<Vec<PathBuf>> {
 
     inputs.sort();
     Ok(inputs)
+}
+
+fn visit_dir(dir: &Path, inputs: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            visit_dir(&path, inputs)?;
+        } else if parser::is_enabled_input(&path) {
+            inputs.push(path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1361,17 +1436,4 @@ mod tests {
         assert!(output.contains("Sample Book With Full Title"));
         assert!(output.contains("~tokens=8,900"));
     }
-}
-
-fn visit_dir(dir: &Path, inputs: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            visit_dir(&path, inputs)?;
-        } else if parser::is_enabled_input(&path) {
-            inputs.push(path);
-        }
-    }
-    Ok(())
 }

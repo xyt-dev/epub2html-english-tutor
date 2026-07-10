@@ -1,51 +1,21 @@
-/// Anthropic Messages API client for paragraph translation.
+/// Multi-provider LLM client for paragraph translation.
+///
+/// Supports two wire formats, chosen via `LlmConfig::format`:
+/// - `Anthropic`: the Anthropic Messages API (`/v1/messages`), also spoken by
+///   most Anthropic-compatible relay gateways (中转站).
+/// - `OpenAi`: the OpenAI Chat Completions API (`/chat/completions`), also
+///   spoken by DeepSeek's native API.
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use crate::llm_config::{ApiFormat, LlmConfig};
 use crate::types::LlmResponse;
 
-const API_VERSION: &str = "2023-06-01";
-const MODEL: &str = "deepseek-v4-flash";
-const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
-
-fn api_url() -> String {
-    let base = std::env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-    format!("{}/v1/messages", base.trim_end_matches('/'))
-}
-
-// ── Request/Response shapes ─────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ApiRequest {
-    model: String,
-    max_tokens: u32,
-    messages: Vec<ApiMessage>,
-    system: String,
-}
-
-#[derive(Serialize)]
-struct ApiMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct ApiResponse {
-    content: Option<Vec<ContentBlock>>,
-    stop_reason: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    text: Option<String>,
-}
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 // ── System prompt ────────────────────────────────────────────────────────────
 
@@ -117,18 +87,19 @@ pub fn estimate_translation_input_tokens(
 #[derive(Clone)]
 pub struct LlmClient {
     client: Client,
-    api_key: String,
+    config: LlmConfig,
     verbose: bool,
 }
 
 impl LlmClient {
-    pub fn new(api_key: String, verbose: bool) -> Self {
+    pub fn new(config: LlmConfig, verbose: bool) -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            client: Client::builder()
-                .timeout(request_timeout())
-                .build()
-                .expect("failed to build HTTP client"),
-            api_key,
+            client,
+            config,
             verbose,
         }
     }
@@ -171,28 +142,28 @@ impl LlmClient {
         items: &[TranslationRequest<'_>],
     ) -> Result<Vec<TranslationResult>> {
         let content = serialize_batch_input(book_title, context, items)?;
-        let max_tokens = max_output_tokens();
-        let url = api_url();
+        let max_tokens = self.config.max_output_tokens;
+        let url = self.api_url();
+        let req_body = self.build_request_body(&content, max_tokens);
 
-        let req_body = ApiRequest {
-            model: MODEL.to_string(),
-            max_tokens,
-            system: SYSTEM_PROMPT.to_string(),
-            messages: vec![ApiMessage {
-                role: "user".to_string(),
-                content,
-            }],
-        };
         if self.verbose {
             print_verbose_request(&url, &req_body);
         }
 
-        let resp = self
+        let mut request = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        request = match self.config.format {
+            ApiFormat::Anthropic => request
+                .header("x-api-key", &self.config.api_key)
+                .header("anthropic-version", ANTHROPIC_API_VERSION),
+            ApiFormat::OpenAi => {
+                request.header("Authorization", format!("Bearer {}", self.config.api_key))
+            }
+        };
+
+        let resp = request
             .json(&req_body)
             .send()
             .await
@@ -209,32 +180,138 @@ impl LlmClient {
             print_verbose_response(status.as_u16(), &response_body);
         }
 
-        let api_resp: ApiResponse =
-            serde_json::from_str(&response_body).context("failed to parse API response")?;
-
-        let text = api_resp
-            .content
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| b.block_type == "text")
-            .filter_map(|b| b.text)
-            .collect::<Vec<_>>()
-            .join("");
-
-        if text.is_empty() {
-            bail!("API returned empty content (batch likely blocked by content filter)");
-        }
-
-        if api_resp.stop_reason.as_deref() == Some("max_tokens") {
-            bail!(
-                "API stopped at max_tokens ({}) after {} response chars; batch JSON is likely truncated. Reduce batch size or raise ANTHROPIC_MAX_OUTPUT_TOKENS if the provider supports it.",
-                max_tokens,
-                text.len(),
-            );
-        }
-
+        let text = self.extract_completion_text(&response_body, max_tokens)?;
         parse_batch_response(&text, items)
     }
+
+    fn api_url(&self) -> String {
+        let base = self.config.base_url.trim_end_matches('/');
+        match self.config.format {
+            ApiFormat::Anthropic => format!("{}/v1/messages", base),
+            ApiFormat::OpenAi => format!("{}/chat/completions", base),
+        }
+    }
+
+    fn build_request_body(&self, content: &str, max_tokens: u32) -> Value {
+        match self.config.format {
+            ApiFormat::Anthropic => {
+                let mut body = json!({
+                    "model": self.config.model,
+                    "max_tokens": max_tokens,
+                    "system": SYSTEM_PROMPT,
+                    "messages": [{"role": "user", "content": content}],
+                });
+                if self.config.thinking {
+                    body["thinking"] = json!({
+                        "type": "enabled",
+                        "budget_tokens": self.config.thinking_budget_tokens,
+                    });
+                }
+                body
+            }
+            ApiFormat::OpenAi => {
+                json!({
+                    "model": self.config.model,
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": content},
+                    ],
+                    "thinking": {
+                        "type": if self.config.thinking { "enabled" } else { "disabled" },
+                    },
+                })
+            }
+        }
+    }
+
+    fn extract_completion_text(&self, response_body: &str, max_tokens: u32) -> Result<String> {
+        match self.config.format {
+            ApiFormat::Anthropic => {
+                let api_resp: AnthropicResponse =
+                    serde_json::from_str(response_body).context("failed to parse API response")?;
+
+                let text = api_resp
+                    .content
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|b| b.block_type == "text")
+                    .filter_map(|b| b.text)
+                    .collect::<Vec<_>>()
+                    .join("");
+
+                if text.is_empty() {
+                    bail!("API returned empty content (batch likely blocked by content filter)");
+                }
+
+                if api_resp.stop_reason.as_deref() == Some("max_tokens") {
+                    bail!(
+                        "API stopped at max_tokens ({}) after {} response chars; batch JSON is likely truncated. Reduce batch size or raise max_output_tokens in llm.toml if the provider supports it.",
+                        max_tokens,
+                        text.len(),
+                    );
+                }
+
+                Ok(text)
+            }
+            ApiFormat::OpenAi => {
+                let api_resp: OpenAiResponse =
+                    serde_json::from_str(response_body).context("failed to parse API response")?;
+
+                let choice = api_resp
+                    .choices
+                    .into_iter()
+                    .next()
+                    .context("API returned no choices")?;
+                let text = choice.message.content.unwrap_or_default();
+
+                if text.is_empty() {
+                    bail!("API returned empty content (batch likely blocked by content filter)");
+                }
+
+                if choice.finish_reason.as_deref() == Some("length") {
+                    bail!(
+                        "API stopped at max_tokens ({}) after {} response chars; batch JSON is likely truncated. Reduce batch size or raise max_output_tokens in llm.toml if the provider supports it.",
+                        max_tokens,
+                        text.len(),
+                    );
+                }
+
+                Ok(text)
+            }
+        }
+    }
+}
+
+// ── Response shapes ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AnthropicResponse {
+    content: Option<Vec<AnthropicContentBlock>>,
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiMessage {
+    content: Option<String>,
 }
 
 fn serialize_batch_input(
@@ -262,7 +339,7 @@ fn serialize_batch_input(
     .context("failed to serialize translation batch request")
 }
 
-fn print_verbose_request(url: &str, req_body: &ApiRequest) {
+fn print_verbose_request(url: &str, req_body: &Value) {
     let json_body = serde_json::to_string_pretty(req_body)
         .unwrap_or_else(|err| format!("<failed to serialize request body: {}>", err));
 
@@ -279,29 +356,12 @@ fn print_verbose_response(status: u16, response_body: &str) {
     );
 }
 
-fn request_timeout() -> Duration {
-    std::env::var("ANTHROPIC_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|&secs| secs > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-}
-
-fn max_output_tokens() -> u32 {
-    std::env::var("ANTHROPIC_MAX_OUTPUT_TOKENS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|&tokens| tokens > 0)
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
-}
-
 fn is_retryable_translation_error(err: &anyhow::Error) -> bool {
     let message = format!("{:#}", err);
     !message.contains("API stopped at max_tokens")
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 struct BatchInput<'a> {
     book: BatchBook<'a>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -309,12 +369,12 @@ struct BatchInput<'a> {
     items: Vec<BatchInputItem<'a>>,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 struct BatchBook<'a> {
     title: &'a str,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 struct BatchInputItem<'a> {
     id: &'a str,
     text: &'a str,
@@ -623,6 +683,22 @@ fn strip_code_fence(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_llm_config(format: ApiFormat, base_url: String) -> LlmConfig {
+        LlmConfig {
+            format,
+            model: "test-model".to_string(),
+            base_url,
+            thinking: false,
+            thinking_budget_tokens: 4096,
+            max_output_tokens: 1024,
+            request_timeout_secs: 5,
+            api_key: "test-key".to_string(),
+            jobs: 2,
+        }
+    }
 
     fn sample_response(id: &str, translation: &str) -> BatchOutputItem {
         BatchOutputItem {
@@ -633,6 +709,211 @@ mod tests {
                 chunks: Vec::new(),
             },
         }
+    }
+
+    fn anthropic_success_response(text: &str) -> Value {
+        json!({
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn"
+        })
+    }
+
+    fn openai_success_response(text: &str) -> Value {
+        json!({
+            "choices": [{"message": {"content": text}, "finish_reason": "stop"}]
+        })
+    }
+
+    #[test]
+    fn anthropic_request_omits_thinking_when_disabled() {
+        let config = test_llm_config(ApiFormat::Anthropic, "http://example.invalid".to_string());
+        let client = LlmClient::new(config, false);
+        let body = client.build_request_body("content", 1024);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn anthropic_request_includes_thinking_budget_when_enabled() {
+        let mut config =
+            test_llm_config(ApiFormat::Anthropic, "http://example.invalid".to_string());
+        config.thinking = true;
+        config.thinking_budget_tokens = 2048;
+        let client = LlmClient::new(config, false);
+        let body = client.build_request_body("content", 4096);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+    }
+
+    #[test]
+    fn openai_request_thinking_type_reflects_config() {
+        let mut enabled_config =
+            test_llm_config(ApiFormat::OpenAi, "http://example.invalid".to_string());
+        enabled_config.thinking = true;
+        let enabled_client = LlmClient::new(enabled_config, false);
+        let enabled_body = enabled_client.build_request_body("content", 4096);
+        assert_eq!(enabled_body["thinking"]["type"], "enabled");
+
+        let disabled_config =
+            test_llm_config(ApiFormat::OpenAi, "http://example.invalid".to_string());
+        let disabled_client = LlmClient::new(disabled_config, false);
+        let disabled_body = disabled_client.build_request_body("content", 4096);
+        assert_eq!(disabled_body["thinking"]["type"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn translate_batch_retries_on_transient_5xx_then_succeeds() {
+        let mock_server = MockServer::start().await;
+        let config = test_llm_config(ApiFormat::Anthropic, mock_server.uri());
+        let client = LlmClient::new(config, false);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(anthropic_success_response(
+                    r#"{"items":[{"id":"p1","translation":"你好","vocabulary":[],"chunks":[]}]}"#,
+                )),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let items = [TranslationRequest {
+            id: "p1",
+            text: "hello",
+        }];
+        let result = client.translate_batch("Book", &[], &items).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].response.translation, "你好");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn translate_batch_retries_on_malformed_json_then_succeeds() {
+        let mock_server = MockServer::start().await;
+        let config = test_llm_config(ApiFormat::Anthropic, mock_server.uri());
+        let client = LlmClient::new(config, false);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(anthropic_success_response(
+                    "this is not json at all, the model went off the rails",
+                )),
+            )
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(anthropic_success_response(
+                    r#"{"items":[{"id":"p1","translation":"你好","vocabulary":[],"chunks":[]}]}"#,
+                )),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let items = [TranslationRequest {
+            id: "p1",
+            text: "hello",
+        }];
+        let result = client.translate_batch("Book", &[], &items).await.unwrap();
+
+        assert_eq!(result[0].response.translation, "你好");
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn translate_batch_gives_up_after_three_attempts() {
+        let mock_server = MockServer::start().await;
+        let config = test_llm_config(ApiFormat::Anthropic, mock_server.uri());
+        let client = LlmClient::new(config, false);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(anthropic_success_response("still not json")),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let items = [TranslationRequest {
+            id: "p1",
+            text: "hello",
+        }];
+        let err = client
+            .translate_batch("Book", &[], &items)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{:#}", err).contains("invalid batch JSON"));
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn translate_batch_does_not_retry_when_truncated_by_max_tokens() {
+        let mock_server = MockServer::start().await;
+        let config = test_llm_config(ApiFormat::Anthropic, mock_server.uri());
+        let client = LlmClient::new(config, false);
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{"type": "text", "text": "{\"items\":["}],
+                "stop_reason": "max_tokens"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let items = [TranslationRequest {
+            id: "p1",
+            text: "hello",
+        }];
+        let err = client
+            .translate_batch("Book", &[], &items)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{:#}", err).contains("API stopped at max_tokens"));
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn translate_batch_openai_format_retries_then_succeeds() {
+        let mock_server = MockServer::start().await;
+        let config = test_llm_config(ApiFormat::OpenAi, mock_server.uri());
+        let client = LlmClient::new(config, false);
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(openai_success_response(
+                    r#"{"items":[{"id":"p1","translation":"你好","vocabulary":[],"chunks":[]}]}"#,
+                )),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let items = [TranslationRequest {
+            id: "p1",
+            text: "hello",
+        }];
+        let result = client.translate_batch("Book", &[], &items).await.unwrap();
+
+        assert_eq!(result[0].response.translation, "你好");
     }
 
     #[test]

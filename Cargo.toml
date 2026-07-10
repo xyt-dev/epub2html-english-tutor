@@ -1,6 +1,6 @@
 [package]
 name = "epub-reader"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -19,3 +19,7 @@ indicatif = "0.17"
 html-escape = "0.2"
 pulldown-cmark = "0.12"
 syntect = "5"
+toml = "1.1.2"
+
+[dev-dependencies]
+wiremock = "0.6.5"

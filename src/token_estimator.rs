@@ -86,7 +86,7 @@ fn flush_runs(tokens: &mut usize, ascii_run_chars: &mut usize, non_ascii_run_byt
 }
 
 fn ceil_div(value: usize, divisor: usize) -> usize {
-    (value + divisor - 1) / divisor
+    value.div_ceil(divisor)
 }
 
 fn is_word_connector(ch: char) -> bool {

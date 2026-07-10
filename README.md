@@ -2,7 +2,7 @@
 
 [English](README_en.md)
 
-> 把 `.epub`、`.md/.markdown`、`.txt` 转成可阅读 HTML，并调用 Claude 为每段生成译文、词汇讲解和短语分析。支持断点续传、离线重建、可控并发翻译、连续段落批请求和可配置文本分段。
+> 把 `.epub`、`.md/.markdown`、`.txt` 转成可阅读 HTML，并调用大模型（支持 Anthropic 格式或 OpenAI 格式，兼容 DeepSeek 官方 API 和各类中转站）为每段生成译文、词汇讲解和短语分析。支持断点续传、离线重建、可控并发翻译、连续段落批请求和可配置文本分段。
 
 ![png](1.png)
 
@@ -13,7 +13,7 @@
 - 输出阅读友好的 HTML，每段带 3 个折叠区块
 - Markdown fenced code block 和 EPUB/HTML 里的 `<pre>` 代码块会原样保留
 - 代码块不参与翻译，但会在 HTML 中以 Catppuccin Mocha 风格做语法高亮
-- 调用 Claude 返回结构化 JSON：译文 / 词汇 / chunks
+- 调用大模型返回结构化 JSON：译文 / 词汇 / chunks，支持 Anthropic 格式（含中转站）和 OpenAI 格式（含 DeepSeek）
 - 连续段落会按批次请求 Claude，并在请求和响应里显式携带段落 ID
 - 支持 `Ctrl+C` 中断后继续跑，已完成段落不会重复请求
 - 支持 `--rebuild` 离线重建 HTML，不调用 API
@@ -35,11 +35,10 @@
 # 安装 Rust（若未安装）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# 设置 Anthropic API Key
-export ANTHROPIC_AUTH_TOKEN="sk-ant-..."
-
-# 可选：自定义兼容网关
-export ANTHROPIC_BASE_URL="https://api.anthropic.com"
+# LLM 相关设置统一放在 llm.toml（provider/model/base_url/thinking），API Key 只走环境变量
+# 参考仓库自带的 llm.toml，按需修改后设置对应的环境变量，例如：
+export ANTHROPIC_AUTH_TOKEN="sk-ant-..."   # provider = "anthropic" 时
+# export DEEPSEEK_API_KEY="sk-..."        # provider = "openai" 时（DeepSeek 原生 API）
 ```
 
 ### 编译
@@ -91,7 +90,8 @@ cargo run --release -- --jobs 3 --request-delay-ms 250 ./books
 
 说明：
 
-- `--jobs` 控制同时进行的批请求数，而不是单段请求数
+- `--jobs` 控制同时进行的批请求数，而不是单段请求数；也可以写进 `llm.toml` 的 `jobs`
+- 并发只影响吞吐，不影响每批附带的原文上下文；上下文始终按原文位置切片
 - 每个批次默认会尽量保持连续段落，并把有效字符数控制在 `7000` 以内
 - `--context-paragraphs` 默认带前 `10` 段原文作为上下文；设为 `0` 可关闭
 
@@ -291,7 +291,7 @@ output/
 - 每个请求会发送一个 `items` 数组，数组里每项都带 `id` 和 `text`
 - 每个请求都会发送 `book.title`，用于书名、卷名和整体语气参考
 - 每个请求默认还会带一个 `context` 数组，包含前 `10` 段原文，仅供上下文参考，不要求模型输出
-- Claude 必须返回同样带 `id` 的 `items` 数组
+- 模型必须返回同样带 `id` 的 `items` 数组
 - 本地会按 `id` 校验、重排并写回 HTML / `state.json`
 
 当前默认策略：
@@ -355,7 +355,7 @@ cargo run --release -- --rebuild ./books ./output
 
 1. 解析输入文件，得到统一的 `Book` 结构
 2. 为正文生成可翻译段落骨架，并把代码块作为只读高亮模块保留
-3. 将连续段落按批次组成 `items[{id, text}]` 请求，并发发送给 Claude
+3. 将连续段落按批次组成 `items[{id, text}]` 请求，并发发送给配置的模型
 4. 收到 `items[{id, translation, vocabulary, chunks}]` 后按 `para_id` 校验并 patch HTML
 5. 先原子写入 HTML，再写入 `*_state.json`
 6. 浏览器端按段落锚点保存阅读位置和折叠状态
@@ -381,18 +381,43 @@ src/
 ├── markdown_parser.rs # Markdown 解析
 ├── text_parser.rs     # TXT 解析
 ├── html_gen.rs        # HTML 生成与段落 patch
-├── llm_client.rs      # Anthropic Messages API 客户端
+├── llm_config.rs      # llm.toml 配置读取与合并（provider/model/base_url/thinking）
+├── llm_client.rs      # Anthropic / OpenAI 兼容客户端
 ├── state.rs           # state.json 读写
 ├── fs_utils.rs        # 原子写文件
 ├── ui.rs              # 终端输出样式
 └── types.rs           # Book / Paragraph / LlmResponse 等结构
 ```
 
+## LLM 配置
+
+模型相关设置统一放在 `llm.toml`（默认路径，可用 `--llm-config` 指定别的文件）：
+
+```toml
+[llm]
+provider = "anthropic"        # "anthropic" 或 "openai"
+model = "deepseek-v4-flash"
+base_url = "https://api.anthropic.com"
+thinking = false              # 默认关闭；DeepSeek/Claude 均支持开启
+# thinking_budget_tokens = 4096
+# api_key_env = "ANTHROPIC_AUTH_TOKEN"
+# max_output_tokens = 8192
+# request_timeout_secs = 180
+```
+
+- `provider = "anthropic"`：走 Anthropic Messages API（`/v1/messages`），兼容官方地址和各类中转站
+- `provider = "openai"`：走 OpenAI Chat Completions 格式（`/chat/completions`），兼容 DeepSeek 官方 API
+- API Key 永远只从环境变量读取，变量名由 `api_key_env` 指定（默认 `anthropic` 对应 `ANTHROPIC_AUTH_TOKEN`，`openai` 对应 `DEEPSEEK_API_KEY`），不会写进配置文件
+- CLI 参数会覆盖 `llm.toml`：`--llm-provider` `--llm-model` `--llm-base-url` `--llm-thinking` / `--llm-no-thinking`
+- `thinking` 默认关闭；`--llm-thinking` 和 `--llm-no-thinking` 不能同时使用
+
+- `jobs` 可写在 `llm.toml` 中作为默认并发数，CLI 的 `--jobs` 会覆盖它
+
 ## 注意事项
 
-- `ANTHROPIC_AUTH_TOKEN` 只在正常翻译模式下需要；`--rebuild` 不需要
+- API Key 只在正常翻译模式下需要（走 `llm.toml` 里 `api_key_env` 指定的环境变量）；`--rebuild` 不需要
 - 如果你修改了原始输入文件，段落 ID 可能变化，旧 state 可能无法完全复用
-- `--jobs` 不是越大越好，通常 `2~4` 比较稳
+- `--jobs` 可以设得很高，也不会改变翻译上下文；但是否值得调高取决于你的 provider 并发 / RPM / TPM 限额，以及本次任务总批次数
 - 对排版特别碎的 TXT，建议试试：
   - `--txt-hard-linebreaks`
   - `--min-paragraph-chars 1`

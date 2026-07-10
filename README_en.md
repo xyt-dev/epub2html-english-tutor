@@ -2,7 +2,7 @@
 
 [中文](README.md)
 
-> Convert `.epub`, `.md/.markdown`, and `.txt` into readable HTML, then use Claude to generate a translation, vocabulary notes, and chunk analysis for each paragraph. Supports resume-after-interrupt, offline rebuild, controlled concurrency, contiguous paragraph batching, and configurable text segmentation.
+> Convert `.epub`, `.md/.markdown`, and `.txt` into readable HTML, then call an LLM (Anthropic-format API, including compatible relay gateways, or OpenAI-format API, including DeepSeek's native API) to generate a translation, vocabulary notes, and chunk analysis for each paragraph. Supports resume-after-interrupt, offline rebuild, controlled concurrency, contiguous paragraph batching, and configurable text segmentation.
 
 ![png](1.png)
 
@@ -13,7 +13,7 @@
 - Produces reader-friendly HTML with 3 collapsible AI sections per paragraph
 - Preserves fenced Markdown code blocks and EPUB/HTML `<pre>` blocks in the output
 - Code blocks are not sent for translation and are rendered with offline Catppuccin Mocha syntax highlighting
-- Calls Claude and expects structured JSON: translation / vocabulary / chunks
+- Calls the configured LLM and expects structured JSON: translation / vocabulary / chunks, over either Anthropic format (incl. relay gateways) or OpenAI format (incl. DeepSeek)
 - Sends contiguous paragraphs in batches and carries explicit paragraph IDs in both request and response payloads
 - Supports `Ctrl+C` interrupt and resume without redoing completed paragraphs
 - Supports `--rebuild` to regenerate HTML from state files without API calls
@@ -35,11 +35,11 @@
 # Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Set your Anthropic API key
-export ANTHROPIC_AUTH_TOKEN="sk-ant-..."
-
-# Optional: custom compatible gateway
-export ANTHROPIC_BASE_URL="https://api.anthropic.com"
+# LLM settings (provider/model/base_url/thinking) live in llm.toml; the API
+# key itself always comes from an environment variable.
+# Check the bundled llm.toml, adjust it, then set the matching env var, e.g.:
+export ANTHROPIC_AUTH_TOKEN="sk-ant-..."   # when provider = "anthropic"
+# export DEEPSEEK_API_KEY="sk-..."        # when provider = "openai" (DeepSeek native API)
 ```
 
 ### Build
@@ -91,7 +91,8 @@ cargo run --release -- --jobs 3 --request-delay-ms 250 ./books
 
 Notes:
 
-- `--jobs` controls concurrent batch requests, not concurrent single paragraphs
+- `--jobs` controls concurrent batch requests, not concurrent single paragraphs; you can also set a default `jobs` value in `llm.toml`
+- Concurrency affects throughput only, not the source context attached to each batch; context is always sliced from fixed source positions
 - Each batch keeps contiguous paragraphs and tries to stay within `7000` effective characters
 - `--context-paragraphs` defaults to the previous `10` source paragraphs; set it to `0` to disable context
 
@@ -377,18 +378,43 @@ src/
 ├── markdown_parser.rs # Markdown parsing
 ├── text_parser.rs     # TXT parsing
 ├── html_gen.rs        # HTML generation and paragraph patching
-├── llm_client.rs      # Anthropic Messages API client
+├── llm_config.rs      # llm.toml loading and merging (provider/model/base_url/thinking)
+├── llm_client.rs      # Anthropic / OpenAI-compatible client
 ├── state.rs           # state.json read/write
 ├── fs_utils.rs        # Atomic file writing
 ├── ui.rs              # Terminal presentation
 └── types.rs           # Book / Paragraph / LlmResponse structures
 ```
 
+## LLM Configuration
+
+All model settings live in `llm.toml` (default path; use `--llm-config` to point elsewhere):
+
+```toml
+[llm]
+provider = "anthropic"        # "anthropic" or "openai"
+model = "deepseek-v4-flash"
+base_url = "https://api.anthropic.com"
+thinking = false              # off by default; both DeepSeek and Claude support enabling it
+# thinking_budget_tokens = 4096
+# api_key_env = "ANTHROPIC_AUTH_TOKEN"
+# max_output_tokens = 8192
+# request_timeout_secs = 180
+```
+
+- `provider = "anthropic"`: speaks the Anthropic Messages API (`/v1/messages`), compatible with the official endpoint and relay gateways
+- `provider = "openai"`: speaks the OpenAI Chat Completions format (`/chat/completions`), compatible with DeepSeek's native API
+- The API key always comes from an environment variable, named by `api_key_env` (defaults to `ANTHROPIC_AUTH_TOKEN` for `anthropic`, `DEEPSEEK_API_KEY` for `openai`); it is never written to the config file
+- CLI flags override `llm.toml`: `--llm-provider`, `--llm-model`, `--llm-base-url`, `--llm-thinking` / `--llm-no-thinking`
+- `thinking` is off by default; `--llm-thinking` and `--llm-no-thinking` cannot be used together
+
+- `jobs` can be set in `llm.toml` as the default concurrency; CLI `--jobs` overrides it
+
 ## Notes
 
-- `ANTHROPIC_AUTH_TOKEN` is only required for translation mode; it is not needed for `--rebuild`
+- An API key is only required in translation mode, via the environment variable named in `llm.toml`'s `api_key_env`; `--rebuild` does not need one
 - If you modify the source input after starting a run, paragraph IDs may change and old state may no longer align perfectly
-- `--jobs` is not always “higher is better”; `2~4` is usually a reasonable range
+- `--jobs` can be set very high without changing translation context, but whether that helps depends on your provider's concurrency / RPM / TPM limits and on how many batches the current job actually has
 - For messy TXT input, try:
   - `--txt-hard-linebreaks`
   - `--min-paragraph-chars 1`

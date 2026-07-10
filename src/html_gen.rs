@@ -143,7 +143,7 @@ fn pick_syntax<'a>(
     code: &str,
 ) -> &'a SyntaxReference {
     language
-        .and_then(|lang| normalized_language_token(lang))
+        .and_then(normalized_language_token)
         .and_then(|lang| syntax_set.find_syntax_by_token(&lang))
         .or_else(|| syntax_set.find_syntax_by_first_line(code))
         .unwrap_or_else(|| syntax_set.find_syntax_plain_text())

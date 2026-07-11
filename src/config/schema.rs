@@ -1,11 +1,12 @@
-//! On-disk and resolved shapes for LLM provider configuration.
+//! On-disk profile templates and resolved LLM configuration.
 //!
-//! Non-secret settings (API format, model, base URL, thinking toggle, ...)
-//! live in one TOML file. The API key itself is never stored in that file:
-//! it is always read from an environment variable, whose name is
-//! configurable via `api_key_env`.
+//! The platform TOML stores one or more reusable profile templates. A
+//! template may contain an API key directly; `api_key_env` is consulted only
+//! when that direct key is absent. Per-book state stores a resolved,
+//! non-secret [`LlmProfileSnapshot`] so resumptions keep the same settings.
 
 use anyhow::{bail, Result};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 /// Wire format used to talk to the provider.
@@ -50,6 +51,33 @@ impl ApiFormat {
     }
 }
 
+pub(crate) fn is_deepseek_endpoint(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host == "deepseek.com" || host.ends_with(".deepseek.com"))
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn normalize_base_url(raw: &str) -> Result<String> {
+    if raw.is_empty() || raw.trim() != raw {
+        bail!("LLM base URL must be non-empty and have no surrounding whitespace");
+    }
+    let normalized = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("https://{raw}")
+    };
+    let parsed = reqwest::Url::parse(&normalized)
+        .map_err(|_| anyhow::anyhow!("invalid LLM base URL {:?}", raw))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        bail!("LLM base URL must use HTTP or HTTPS and include a host");
+    }
+    Ok(normalized.trim_end_matches('/').to_string())
+}
+
 impl std::fmt::Display for ApiFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -59,54 +87,149 @@ impl std::fmt::Display for ApiFormat {
     }
 }
 
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+/// Requested model thinking intensity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingEffort {
+    Low,
+    Medium,
+    #[default]
+    High,
+    #[serde(rename = "xhigh")]
+    #[value(name = "xhigh", alias = "x-high")]
+    XHigh,
+    Max,
+}
+
+impl ThinkingEffort {
+    pub fn normalized_deepseek(self) -> &'static str {
+        match self {
+            Self::Low | Self::Medium | Self::High => "high",
+            Self::XHigh | Self::Max => "max",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl std::fmt::Display for ThinkingEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32768;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 180;
-pub const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 4096;
-pub const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
-pub const DEFAULT_JOBS: usize = 2;
+pub const DEFAULT_THINKING_EFFORT: ThinkingEffort = ThinkingEffort::High;
+pub const DEFAULT_JOBS: usize = 20;
 
 /// Fully resolved configuration ready to build an [`crate::llm_client::LlmClient`] from.
-#[derive(Debug, Clone)]
+///
+/// Deliberately does not implement `Debug`: `api_key` is secret.
+#[derive(Clone)]
 pub struct LlmConfig {
+    pub profile_name: String,
     pub format: ApiFormat,
     pub model: String,
     pub base_url: String,
     pub thinking: bool,
-    pub thinking_budget_tokens: u32,
+    pub thinking_effort: ThinkingEffort,
     pub max_output_tokens: u32,
     pub request_timeout_secs: u64,
     pub api_key: String,
     pub jobs: usize,
 }
 
-/// Raw on-disk shape of the TOML file. Every field is optional so the file
-/// itself is optional and each field can be partially specified.
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct FileConfig {
-    #[serde(default)]
-    pub llm: LlmSection,
+/// The actual, non-secret configuration used by one resumable translation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmProfileSnapshot {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub thinking: bool,
+    pub thinking_effort: ThinkingEffort,
+    pub max_output_tokens: u32,
+    pub request_timeout_secs: u64,
+    /// Environment-variable locator used only when the current profile has no inline key.
+    pub api_key_env: String,
+    pub jobs: usize,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct LlmSection {
+/// Platform configuration. Serializing `llm` produces a `[[llm]]` array of
+/// tables. Deserialization also accepts the former singleton `[llm]` table.
+#[derive(Default, Deserialize, Serialize)]
+pub struct FileConfig {
+    #[serde(default, deserialize_with = "deserialize_llm_profiles")]
+    pub llm: Vec<LlmProfile>,
+}
+
+fn deserialize_llm_profiles<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<LlmProfile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(LlmProfile),
+        Many(Vec<LlmProfile>),
+    }
+
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(profile) => vec![profile],
+        OneOrMany::Many(profiles) => profiles,
+    })
+}
+
+/// Reusable model template stored under one `[[llm]]` entry.
+///
+/// Deliberately does not implement `Debug`: `api_key` may be present.
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct LlmProfile {
+    #[serde(default)]
+    pub name: String,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub thinking: Option<bool>,
-    pub thinking_budget_tokens: Option<u32>,
+    pub thinking_effort: Option<ThinkingEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub max_output_tokens: Option<u32>,
     pub request_timeout_secs: Option<u64>,
     pub jobs: Option<usize>,
 }
 
-/// CLI-provided overrides. `None` means "not specified, defer to the config
-/// file / built-in default".
+/// CLI-provided overrides. `None` means "not specified, defer to the saved
+/// effective configuration or selected profile template".
 #[derive(Debug, Default, Clone)]
 pub struct LlmConfigOverrides {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub thinking: Option<bool>,
+    pub thinking_effort: Option<ThinkingEffort>,
     pub jobs: Option<usize>,
+}
+
+impl LlmConfigOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none()
+            && self.model.is_none()
+            && self.base_url.is_none()
+            && self.thinking.is_none()
+            && self.thinking_effort.is_none()
+            && self.jobs.is_none()
+    }
 }

@@ -1,46 +1,42 @@
-# LLM provider configuration for epub-reader.
+# Reusable LLM profile templates for epub-reader.
 #
-# This file holds only non-secret settings. The API key itself is never
-# stored here — it is always read from an environment variable (see
-# `api_key_env` below). CLI flags (--llm-provider/--llm-model/--llm-base-url/
-# --llm-thinking/--llm-no-thinking/--jobs) override whatever is set in this file.
+# The running program reads the platform config (for example
+# ~/.config/epub-reader/llm.toml), never this repository template.
+# Run `epub-reader --setup` to append a profile interactively.
+#
+# Each `[[llm]]` table is one selectable template with a unique `name`.
+# A new book selects a template once. Its effective non-secret settings are
+# then saved at the head of that book's *_state.json for deterministic resume.
 
-[llm]
-# Wire format to speak to the provider:
-# - "anthropic": Anthropic Messages API (/v1/messages). Also spoken by most
-#   Anthropic-compatible relay gateways (中转站).
-# - "openai": OpenAI Chat Completions API (/chat/completions). Also spoken
-#   by DeepSeek's native API.
+[[llm]]
+name = "deepseek-pro"
+
+# Wire format: "anthropic" (/v1/messages) or "openai" (/chat/completions).
 provider = "openai"
-
-# Model name sent to the provider.
 model = "deepseek-v4-pro"
+base_url = "api.deepseek.com" # `https://` is added when omitted
 
-# API base URL. Defaults depend on `provider` when omitted:
-# - anthropic -> https://api.anthropic.com
-# - openai    -> https://api.deepseek.com
-base_url = "https://api.deepseek.com"
+# Credential precedence:
+# 1. A non-empty `api_key` stored directly in this platform config.
+# 2. The environment variable named by `api_key_env`.
+# 3. Provider default: ANTHROPIC_AUTH_TOKEN or DEEPSEEK_API_KEY.
+#
+# Inline keys are plaintext in the owner-only platform config. Setup input is
+# visible, but keys are never copied into state JSON, translation logs, or errors.
+# api_key = "..."
+api_key_env = "DEEPSEEK_API_KEY"
 
-# Name of the environment variable holding the API key. Defaults depend on
-# `provider` when omitted:
-# - anthropic -> ANTHROPIC_AUTH_TOKEN
-# - openai    -> DEEPSEEK_API_KEY
-# api_key_env = "DEEPSEEK_API_KEY"
-
-# Enable model thinking/reasoning mode. Defaults to false (thinking off).
 thinking = false
-
-# Token budget reserved for thinking when `thinking = true`. Only enforced
-# for the Anthropic format (must be >= 1024 and < max_output_tokens).
-# thinking_budget_tokens = 4096
-
-# Maximum tokens the model may generate per request.
-# max_output_tokens = 8192
-
-# HTTP request timeout, in seconds.
+# thinking_effort = "high"       # low / medium / high / xhigh / max
+max_output_tokens = 32768
 # request_timeout_secs = 180
-
-# Maximum concurrent translation requests. This controls how many batch API
-# calls can be in flight at once. Higher values do not change the source
-# context attached to each request; they only affect throughput.
 jobs = 10
+
+[[llm]]
+name = "anthropic-default"
+provider = "anthropic"
+model = "deepseek-v4-flash"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_AUTH_TOKEN"
+thinking = false
+jobs = 2

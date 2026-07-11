@@ -35,15 +35,12 @@
 # Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# LLM settings (provider/model/base_url/thinking) live in llm.toml inside the
-# platform-standard config directory (e.g. ~/.config/epub-reader/llm.toml on
-# Linux). The project's own llm.toml is just a commented template; it is
-# never read at runtime. Easiest way to set things up:
+# LLM provider/model settings live in llm.toml under the platform config
+# directory (for example ~/.config/epub-reader/llm.toml on Linux). The
+# repository's llm.toml is only a template. Each wizard run appends one
+# reusable profile; API key input is visible:
 cargo run --release -- --setup
-# The wizard only asks about the common fields (provider/model/base_url/
-# api_key_env/thinking/jobs), then tells you which env var to set, e.g.:
-export ANTHROPIC_AUTH_TOKEN="sk-ant-..."   # when provider = "anthropic"
-# export DEEPSEEK_API_KEY="sk-..."        # when provider = "openai" (DeepSeek native API)
+# Or omit the stored key and use that profile's api_key_env as a fallback.
 ```
 
 ### Build
@@ -132,10 +129,10 @@ cargo run --release -- --rebuild ./books ./output
 ## CLI Usage
 
 ```text
-Usage: epub-reader [OPTIONS] <INPUT> [OUTPUT]
+Usage: epub-reader [OPTIONS] [INPUT] [OUTPUT]
 
 Arguments:
-  <INPUT>   Input file or directory (.epub/.md/.markdown/.txt)
+  [INPUT]   Input file or directory (.epub/.md/.markdown/.txt); required unless --setup is used
   [OUTPUT]  Output directory for HTML and state files [default: output]
 
 Options:
@@ -143,10 +140,14 @@ Options:
           Rebuild HTML from existing state files without API calls
       --count
           Count translatable source text and exit without API calls or output files
+      --setup
+          Run the interactive LLM setup wizard and exit
+      --switch
+          Select a different LLM profile for each translated book
   -v, --verbose
           Print full LLM request and response bodies to stderr
       --jobs <JOBS>
-          Maximum number of concurrent translation requests [default: 2]
+          Override concurrent translation requests from the LLM config
       --request-delay-ms <REQUEST_DELAY_MS>
           Delay in milliseconds before launching each translation request [default: 0]
       --context-paragraphs <CONTEXT_PARAGRAPHS>
@@ -161,6 +162,20 @@ Options:
           In .txt files, treat each non-empty line as its own paragraph
       --txt-no-sentence-split
           In .txt files, do not start a new paragraph after sentence-ending punctuation
+      --llm-config <PATH>
+          Path to the LLM provider config file (default: platform config dir, e.g. ~/.config/epub-reader/llm.toml)
+      --llm-provider <PROVIDER>
+          Override the LLM API format from the LLM config: 'anthropic' or 'openai'
+      --llm-model <MODEL>
+          Override the LLM model from the LLM config
+      --llm-base-url <URL>
+          Override the LLM API base URL from the LLM config
+      --llm-thinking
+          Enable model thinking/reasoning mode (overrides the LLM config; default off)
+      --llm-thinking-effort <LEVEL>
+          Set model thinking/reasoning effort: low, medium, high, xhigh, or max (also enables thinking) [possible values: low, medium, high, xhigh, max]
+      --llm-no-thinking
+          Disable model thinking/reasoning mode (overrides the LLM config)
   -h, --help
           Print help
   -V, --version
@@ -390,48 +405,70 @@ src/
 └── types.rs           # Book / Paragraph / LlmResponse structures
 ```
 
-## LLM Configuration
+## LLM Configuration and Profile Selection
 
-The config file does not live in the project directory; it lives in the
-platform-standard config directory instead (override with `--llm-config`):
+The live config file is in the platform-standard config directory (override it with `--llm-config`):
 
 - Linux: `$XDG_CONFIG_HOME/epub-reader/llm.toml` (falls back to `~/.config/epub-reader/llm.toml`)
 - macOS: `~/Library/Application Support/epub-reader/llm.toml`
 - Windows: `%APPDATA%\epub-reader\llm.toml`
 
-The project's own `llm.toml` is just a commented template/example; the running program never reads it.
-
-Easiest way to configure: run the interactive wizard, which only asks about the common fields and writes the result immediately:
+The repository's `llm.toml` is only a commented template and is never read at runtime. The easiest way to maintain the live file is the wizard; **each run appends one profile** without replacing existing entries:
 
 ```bash
 cargo run --release -- --setup
 ```
 
-The file can also be hand-written:
+The file can also be written by hand. It is an array of `[[llm]]` tables, each with a unique name:
 
 ```toml
-[llm]
-provider = "anthropic"        # "anthropic" or "openai"
-model = "deepseek-v4-flash"
-base_url = "https://api.anthropic.com"
-thinking = false              # off by default; both DeepSeek and Claude support enabling it
-# thinking_budget_tokens = 4096
-# api_key_env = "ANTHROPIC_AUTH_TOKEN"
-# max_output_tokens = 8192
+[[llm]]
+name = "deepseek-pro"
+provider = "openai"                 # "anthropic" or "openai"
+model = "deepseek-v4-pro"
+base_url = "api.deepseek.com"       # https:// is added when the scheme is omitted
+api_key = "..."                     # optional: store directly in platform config
+api_key_env = "DEEPSEEK_API_KEY"    # optional fallback when api_key is absent
+thinking = false
+# thinking_effort = "high"          # low / medium / high / xhigh / max
+max_output_tokens = 32768
 # request_timeout_secs = 180
+jobs = 10
+
+[[llm]]
+name = "anthropic-default"
+provider = "anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "ANTHROPIC_AUTH_TOKEN"
+thinking = false
 jobs = 2
 ```
 
-- `provider = "anthropic"`: speaks the Anthropic Messages API (`/v1/messages`), compatible with the official endpoint and relay gateways
-- `provider = "openai"`: speaks the OpenAI Chat Completions format (`/chat/completions`), compatible with DeepSeek's native API
-- The API key always comes from an environment variable, named by `api_key_env` (defaults to `ANTHROPIC_AUTH_TOKEN` for `anthropic`, `DEEPSEEK_API_KEY` for `openai`); it is never written to the config file
-- Precedence: CLI overrides > config file > built-in defaults. CLI overrides: `--llm-provider`, `--llm-model`, `--llm-base-url`, `--llm-thinking` / `--llm-no-thinking`, `--jobs`
-- `thinking` is off by default; `--llm-thinking` and `--llm-no-thinking` cannot be used together
-- With no config file present, the program falls back to CLI flags plus built-in defaults; run `--setup` to create one interactively
+### Profile lifecycle
+
+- A new book auto-selects the sole profile. If several exist, the terminal asks once.
+- The selected profile's effective non-secret settings are written to the leading `llm` field in that book's `*_state.json`. API keys never enter state.
+- Resume reuses the provider / model / base URL / thinking / jobs snapshot in state and obtains only the current credential from the profile with the saved name. Later template edits therefore cannot silently change an existing book.
+- Use `--switch` explicitly to select a different profile for an existing book and replace its saved `llm` snapshot. Completed paragraphs remain, so output produced before and after a switch may use different models.
+- Legacy state without an `llm` field remains readable; the next normal translation selects a profile once and adds the snapshot.
+- If a saved profile has been removed, translation fails with instructions to use `--switch`; it never silently substitutes another model.
+
+### Credentials and overrides
+
+- Key precedence is: non-empty profile `api_key` > the environment variable named by `api_key_env` > the provider default (`ANTHROPIC_AUTH_TOKEN` for Anthropic, `DEEPSEEK_API_KEY` for OpenAI/DeepSeek).
+- API key input in the wizard is visible plaintext. On Unix it writes the config as `0600`; keys are excluded from state, logs, and errors. The config is still a plaintext local credential file and should be handled as sensitive.
+- Non-secret precedence is: CLI override > selected profile > built-in default. Overrides include `--llm-provider`, `--llm-model`, `--llm-base-url`, `--llm-thinking` / `--llm-no-thinking`, `--llm-thinking-effort`, and `--jobs`.
+- For a new book or `--switch`, CLI overrides become part of the saved snapshot. Passing override flags while directly resuming an existing snapshot requires explicit `--switch`.
+- `provider = "anthropic"` uses Anthropic Messages (`/v1/messages`); `provider = "openai"` uses OpenAI Chat Completions (`/chat/completions`, including DeepSeek's native API).
+- `thinking` is off by default. `thinking_effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`; `--llm-thinking-effort` also enables thinking and cannot be combined with `--llm-no-thinking`.
+- Thinking intensity always uses the provider's official effort field and never uses or persists `thinking_budget_tokens`: Anthropic Messages uses `output_config.effort`, while OpenAI format uses `reasoning_effort`; DeepSeek only normalizes unsupported levels to its officially supported values.
+- `base_url` may omit its scheme, as in `apiclaude.cc`; it is normalized to `https://apiclaude.cc`. Explicit `http://` and `https://` schemes are preserved.
+- The built-in `max_output_tokens` default is `32768`. Each `[[llm]]` profile can override it, and `--setup` prompts for the value.
+- With no profiles configured, translation asks you to run `--setup`; `--count` and `--rebuild` need neither a profile nor an API key.
 
 ## Notes
 
-- An API key is only required in translation mode, via the environment variable named by the config file's `api_key_env`; `--rebuild` does not need one
+- An API key is required only in normal translation mode when paragraphs remain; it may come from profile `api_key` or its environment fallback, while `--count` / `--rebuild` need none
 - If you modify the source input after starting a run, paragraph IDs may change and old state may no longer align perfectly
 - `--jobs` can be set very high without changing translation context, but whether that helps depends on your provider's concurrency / RPM / TPM limits and on how many batches the current job actually has
 - For messy TXT input, try:

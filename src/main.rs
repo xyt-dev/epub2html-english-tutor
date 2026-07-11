@@ -15,6 +15,7 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser};
 use console::{measure_text_width, pad_str, Alignment, Term};
+use dialoguer::Select;
 use indicatif::ProgressBar;
 use llm_client::{LlmClient, TranslationRequest};
 use parse_utils::ParseOptions;
@@ -31,7 +32,7 @@ use tokio::task::JoinSet;
     version,
     about = "Convert EPUB/Markdown/Text books into annotated HTML with AI translation.",
     long_about = None,
-    after_help = "Examples:\n  epub-reader --setup\n  epub-reader ../Books\n  epub-reader novel.epub\n  epub-reader notes.md ./out\n  epub-reader --count ../Books\n  epub-reader --jobs 3 novel.epub\n  epub-reader --txt-hard-linebreaks notes.txt ./out\n  epub-reader --rebuild ../Books ./out"
+    after_help = "Examples:\n  epub-reader --setup\n  epub-reader ../Books\n  epub-reader novel.epub\n  epub-reader --switch novel.epub\n  epub-reader notes.md ./out\n  epub-reader --count ../Books\n  epub-reader --jobs 3 novel.epub\n  epub-reader --txt-hard-linebreaks notes.txt ./out\n  epub-reader --rebuild ../Books ./out"
 )]
 struct Args {
     #[arg(
@@ -59,11 +60,14 @@ struct Args {
     )]
     count: bool,
 
-    #[arg(
-        long,
-        help = "Run the interactive LLM setup wizard and exit"
-    )]
+    #[arg(long, help = "Run the interactive LLM setup wizard and exit")]
     setup: bool,
+
+    #[arg(
+        long = "switch",
+        help = "Select a different LLM profile for each translated book"
+    )]
+    switch_profile: bool,
 
     #[arg(
         short,
@@ -162,6 +166,13 @@ struct Args {
         help = "Enable model thinking/reasoning mode (overrides the LLM config; default off)"
     )]
     llm_thinking: bool,
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_enum,
+        help = "Set model thinking/reasoning effort: low, medium, high, xhigh, or max (also enables thinking)"
+    )]
+    llm_thinking_effort: Option<config::ThinkingEffort>,
 
     #[arg(
         long,
@@ -183,6 +194,16 @@ struct JobOutcome {
 #[derive(Debug, Clone)]
 struct TranslationOptions {
     jobs: usize,
+    request_delay: Duration,
+    context_paragraphs: usize,
+}
+
+struct TranslationRuntime {
+    config_path: PathBuf,
+    profiles: Vec<config::LlmProfile>,
+    overrides: config::LlmConfigOverrides,
+    switch_profile: bool,
+    verbose: bool,
     request_delay: Duration,
     context_paragraphs: usize,
 }
@@ -309,58 +330,32 @@ async fn main() -> Result<()> {
     }
     ui::print_input_summary(&input_root, inputs.len());
 
-    let (client, translation_options) = if args.rebuild {
-        (None, None)
+    let translation_runtime = if args.rebuild {
+        None
     } else {
-        let thinking_override = if args.llm_thinking {
-            Some(true)
-        } else if args.llm_no_thinking {
-            Some(false)
-        } else {
-            None
-        };
         let overrides = config::LlmConfigOverrides {
             provider: args.llm_provider.clone(),
             model: args.llm_model.clone(),
             base_url: args.llm_base_url.clone(),
-            thinking: thinking_override,
+            thinking: llm_thinking_override(&args),
+            thinking_effort: args.llm_thinking_effort,
             jobs: args.jobs,
         };
         let config_path = resolve_config_path(&args)?;
-        let llm_config = config::load_llm_config(&config_path, &overrides).with_context(|| {
-            format!(
-                "failed to load LLM config from '{}' (run with --setup to create one)",
-                config_path.display()
-            )
-        })?;
-        let translation_options = TranslationOptions {
-            jobs: llm_config.jobs,
+        let profiles = config::load_llm_profiles(&config_path)?;
+        ui::print_kv(
+            "llm-profiles",
+            format!("{} configured · selected per book", profiles.len()),
+        );
+        Some(TranslationRuntime {
+            config_path,
+            profiles,
+            overrides,
+            switch_profile: args.switch_profile,
+            verbose: args.verbose,
             request_delay: Duration::from_millis(args.request_delay_ms),
             context_paragraphs: args.context_paragraphs,
-        };
-        ui::print_kv(
-            "llm",
-            format!(
-                "{} job(s) · {}ms launch delay · context {} para(s) · adaptive batches target {} / max {} chars · max {} item(s)",
-                translation_options.jobs,
-                args.request_delay_ms,
-                translation_options.context_paragraphs,
-                BATCH_TARGET_CHARS,
-                BATCH_HARD_MAX_CHARS,
-                BATCH_MAX_ITEMS
-            ),
-        );
-        ui::print_kv(
-            "llm-provider",
-            format!(
-                "{} · model={} · thinking={} · base_url={}",
-                llm_config.format, llm_config.model, llm_config.thinking, llm_config.base_url
-            ),
-        );
-        (
-            Some(LlmClient::new(llm_config, args.verbose)),
-            Some(translation_options),
-        )
+        })
     };
 
     let mut succeeded = 0usize;
@@ -375,9 +370,8 @@ async fn main() -> Result<()> {
             process_input(
                 input_path,
                 &args.output_dir,
-                client.as_ref().unwrap(),
                 &parse_options,
-                translation_options.as_ref().unwrap(),
+                translation_runtime.as_ref().unwrap(),
             )
             .await
         };
@@ -456,12 +450,102 @@ fn rebuild_html(
     })
 }
 
+fn select_llm_profile<'a, 'b>(
+    profiles: &'a [config::LlmProfile],
+    saved: Option<&'b config::LlmProfileSnapshot>,
+    force_switch: bool,
+    input_path: &Path,
+) -> Result<(
+    &'a config::LlmProfile,
+    Option<&'b config::LlmProfileSnapshot>,
+)> {
+    if profiles.is_empty() {
+        anyhow::bail!("no LLM profiles are configured; run `epub-reader --setup`");
+    }
+
+    if !force_switch {
+        if let Some(saved) = saved {
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.name == saved.name)
+                .with_context(|| {
+                    format!(
+                        "saved LLM profile {:?} no longer exists in the platform config; \
+                         rerun with --switch to select a replacement",
+                        saved.name
+                    )
+                })?;
+            return Ok((profile, Some(saved)));
+        }
+        if profiles.len() == 1 {
+            return Ok((&profiles[0], None));
+        }
+    }
+    if profiles.len() == 1 {
+        return Ok((&profiles[0], None));
+    }
+
+    if !Term::stderr().is_term() {
+        anyhow::bail!(
+            "an interactive terminal is required to select an LLM profile for '{}'; \
+             configure exactly one profile or resume a state that already has one",
+            input_path.display()
+        );
+    }
+
+    let labels = profiles
+        .iter()
+        .map(|profile| {
+            format!(
+                "{} · {} · {}",
+                profile.name,
+                profile.model.as_deref().unwrap_or("deepseek-v4-flash"),
+                profile.provider.as_deref().unwrap_or("anthropic")
+            )
+        })
+        .collect::<Vec<_>>();
+    let default_index = saved
+        .and_then(|saved| {
+            profiles
+                .iter()
+                .position(|profile| profile.name == saved.name)
+        })
+        .unwrap_or(0);
+    let index = Select::new()
+        .with_prompt(format!("Select LLM profile for {}", input_path.display()))
+        .items(&labels)
+        .default(default_index)
+        .interact()
+        .context("failed to select LLM profile")?;
+    Ok((&profiles[index], None))
+}
+
+fn effective_llm_snapshot(
+    profile: &config::LlmProfile,
+    saved: Option<&config::LlmProfileSnapshot>,
+    overrides: &config::LlmConfigOverrides,
+) -> Result<(config::LlmProfileSnapshot, bool)> {
+    if let Some(saved) = saved {
+        if !overrides.is_empty() {
+            anyhow::bail!(
+                "this book already has an effective LLM configuration; use --switch to \
+                 apply profile override flags"
+            );
+        }
+        let mut effective = saved.clone();
+        effective.base_url = config::normalize_base_url(&effective.base_url)?;
+        let changed = &effective != saved;
+        Ok((effective, changed))
+    } else {
+        Ok((config::materialize_llm_profile(profile, overrides)?, true))
+    }
+}
+
 async fn process_input(
     input_path: &Path,
     output_dir: &Path,
-    client: &LlmClient,
     parse_options: &ParseOptions,
-    translation_options: &TranslationOptions,
+    runtime: &TranslationRuntime,
 ) -> Result<JobOutcome> {
     ui::print_step("parse", "reading source content");
     let book = parser::parse_book(input_path, parse_options)?;
@@ -474,15 +558,6 @@ async fn process_input(
 
     let html_path = output_dir.join(format!("{}.html", book.slug));
     let state_path = state::state_path(output_dir, &book.slug);
-
-    ui::print_step("html", "loading or creating skeleton");
-    let mut html_content = if html_path.exists() {
-        std::fs::read_to_string(&html_path)?
-    } else {
-        let initial_html = html_gen::generate_html(&book);
-        fs_utils::atomic_write(&html_path, initial_html.as_bytes())?;
-        initial_html
-    };
 
     ui::print_step("state", "loading resumable progress");
     let mut st = state::load_state(&state_path)?;
@@ -513,17 +588,83 @@ async fn process_input(
         format!("{} done · {} remaining", already_done, pending.len()),
     );
 
+    let (profile, saved) = select_llm_profile(
+        &runtime.profiles,
+        st.llm.as_ref(),
+        runtime.switch_profile,
+        input_path,
+    )?;
+    let (snapshot, binding_changed) = effective_llm_snapshot(profile, saved, &runtime.overrides)?;
+
+    if binding_changed && runtime.switch_profile && !st.completed.is_empty() {
+        println!(
+            "{}",
+            ui::warn_text(
+                "switching profiles preserves completed paragraphs; future output may mix models"
+            )
+        );
+    }
+    // Persist the canonical effective configuration before credential lookup
+    // or API work. This also removes ignored fields from legacy state files.
+    st.llm = Some(snapshot.clone());
+    state::save_state(&state_path, &st)?;
+
     if pending.is_empty() {
+        if !html_path.exists() {
+            let initial_html = html_gen::generate_html(&book);
+            fs_utils::atomic_write(&html_path, initial_html.as_bytes())?;
+        }
         return Ok(JobOutcome {
             book_title: book.title,
             total_paragraphs,
             completed: already_done,
             html_path,
-            state_path: state_path.exists().then_some(state_path),
+            state_path: Some(state_path),
         });
     }
 
-    ui::print_step("translate", "requesting Claude in adaptive batches");
+    let llm_config = config::resolve_llm_profile(&runtime.config_path, profile, &snapshot)?;
+    let translation_options = TranslationOptions {
+        jobs: llm_config.jobs,
+        request_delay: runtime.request_delay,
+        context_paragraphs: runtime.context_paragraphs,
+    };
+    ui::print_kv(
+        "llm",
+        format!(
+            "{} job(s) · {}ms launch delay · context {} para(s) · adaptive batches target {} / max {} chars · max {} item(s)",
+            translation_options.jobs,
+            translation_options.request_delay.as_millis(),
+            translation_options.context_paragraphs,
+            BATCH_TARGET_CHARS,
+            BATCH_HARD_MAX_CHARS,
+            BATCH_MAX_ITEMS
+        ),
+    );
+    ui::print_kv(
+        "llm-profile",
+        format!(
+            "{} · {} · model={} · thinking={} · effort={} · base_url={}",
+            llm_config.profile_name,
+            llm_config.format,
+            llm_config.model,
+            llm_config.thinking,
+            llm_config.thinking_effort,
+            llm_config.base_url
+        ),
+    );
+    let client = LlmClient::new(llm_config, runtime.verbose);
+
+    ui::print_step("html", "loading or creating skeleton");
+    let mut html_content = if html_path.exists() {
+        std::fs::read_to_string(&html_path)?
+    } else {
+        let initial_html = html_gen::generate_html(&book);
+        fs_utils::atomic_write(&html_path, initial_html.as_bytes())?;
+        initial_html
+    };
+
+    ui::print_step("translate", "requesting selected model in adaptive batches");
     let pb = ProgressBar::new(pending.len() as u64);
     pb.set_style(ui::progress_style(true));
     pb.enable_steady_tick(Duration::from_millis(80));
@@ -552,8 +693,8 @@ async fn process_input(
     fill_translation_queue(
         &mut join_set,
         &mut pending_queue,
-        client,
-        translation_options,
+        &client,
+        &translation_options,
         &mut launched_any,
     )
     .await;
@@ -583,8 +724,8 @@ async fn process_input(
                 fill_translation_queue(
                     &mut join_set,
                     &mut pending_queue,
-                    client,
-                    translation_options,
+                    &client,
+                    &translation_options,
                     &mut launched_any,
                 )
                 .await;
@@ -628,8 +769,8 @@ async fn process_input(
         fill_translation_queue(
             &mut join_set,
             &mut pending_queue,
-            client,
-            translation_options,
+            &client,
+            &translation_options,
             &mut launched_any,
         )
         .await;
@@ -1178,6 +1319,16 @@ fn parse_options_from_args(args: &Args) -> ParseOptions {
     }
 }
 
+fn llm_thinking_override(args: &Args) -> Option<bool> {
+    if args.llm_thinking || args.llm_thinking_effort.is_some() {
+        Some(true)
+    } else if args.llm_no_thinking {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn validate_args(args: &Args) -> Result<()> {
     if args.setup && (args.count || args.rebuild) {
         anyhow::bail!("--setup cannot be used together with --count or --rebuild");
@@ -1188,8 +1339,14 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.count && args.rebuild {
         anyhow::bail!("--count cannot be used together with --rebuild");
     }
+    if args.switch_profile && (args.setup || args.count || args.rebuild) {
+        anyhow::bail!("--switch is only available during normal translation");
+    }
     if args.llm_thinking && args.llm_no_thinking {
         anyhow::bail!("--llm-thinking and --llm-no-thinking cannot be used together");
+    }
+    if args.llm_no_thinking && args.llm_thinking_effort.is_some() {
+        anyhow::bail!("--llm-no-thinking cannot be used together with --llm-thinking-effort");
     }
     if !args.count && args.jobs == Some(0) {
         anyhow::bail!("--jobs must be at least 1");
@@ -1471,5 +1628,194 @@ mod tests {
         assert!(!output.contains('|'));
         assert!(output.contains("Sample Book With Full Title"));
         assert!(output.contains("~tokens=8,900"));
+    }
+    #[test]
+    fn thinking_effort_cli_enables_thinking_override() {
+        let args =
+            Args::try_parse_from(["epub-reader", "book.epub", "--llm-thinking-effort", "xhigh"])
+                .unwrap();
+
+        assert_eq!(
+            args.llm_thinking_effort,
+            Some(config::ThinkingEffort::XHigh)
+        );
+        assert_eq!(llm_thinking_override(&args), Some(true));
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn no_thinking_rejects_effort_override() {
+        let args = Args::try_parse_from([
+            "epub-reader",
+            "book.epub",
+            "--llm-no-thinking",
+            "--llm-thinking-effort",
+            "max",
+        ])
+        .unwrap();
+
+        let err = validate_args(&args).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--llm-no-thinking cannot be used together with --llm-thinking-effort"));
+    }
+    fn test_profile(name: &str) -> config::LlmProfile {
+        config::LlmProfile {
+            name: name.to_string(),
+            provider: Some("openai".to_string()),
+            model: Some(format!("{name}-model")),
+            base_url: Some("https://api.deepseek.com".to_string()),
+            thinking: Some(false),
+            thinking_effort: Some(config::ThinkingEffort::High),
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            max_output_tokens: None,
+            request_timeout_secs: None,
+            jobs: Some(2),
+        }
+    }
+
+    fn test_snapshot(name: &str) -> config::LlmProfileSnapshot {
+        config::LlmProfileSnapshot {
+            name: name.to_string(),
+            provider: "openai".to_string(),
+            model: format!("{name}-saved-model"),
+            base_url: "https://api.deepseek.com".to_string(),
+            thinking: false,
+            thinking_effort: config::ThinkingEffort::High,
+            max_output_tokens: 8192,
+            request_timeout_secs: 180,
+            api_key_env: "DEEPSEEK_API_KEY".to_string(),
+            jobs: 2,
+        }
+    }
+
+    #[test]
+    fn sole_profile_is_selected_for_new_state_without_prompt() {
+        let profiles = vec![test_profile("only")];
+
+        let (selected, saved) =
+            select_llm_profile(&profiles, None, false, Path::new("book.epub")).unwrap();
+
+        assert_eq!(selected.name, "only");
+        assert!(saved.is_none());
+    }
+
+    #[test]
+    fn switch_auto_selects_the_only_available_profile() {
+        let profiles = vec![test_profile("replacement")];
+        let previous = test_snapshot("removed");
+
+        let (selected, saved) =
+            select_llm_profile(&profiles, Some(&previous), true, Path::new("book.epub")).unwrap();
+
+        assert_eq!(selected.name, "replacement");
+        assert!(saved.is_none());
+    }
+
+    #[test]
+    fn saved_profile_is_reused_from_multiple_profiles() {
+        let profiles = vec![test_profile("first"), test_profile("saved")];
+        let snapshot = test_snapshot("saved");
+
+        let (selected, saved) =
+            select_llm_profile(&profiles, Some(&snapshot), false, Path::new("book.epub")).unwrap();
+
+        assert_eq!(selected.name, "saved");
+        assert_eq!(saved.unwrap(), &snapshot);
+    }
+
+    #[test]
+    fn removed_saved_profile_requires_explicit_switch() {
+        let profiles = vec![test_profile("replacement")];
+        let snapshot = test_snapshot("removed");
+
+        let error = select_llm_profile(&profiles, Some(&snapshot), false, Path::new("book.epub"))
+            .err()
+            .expect("removed saved profile must not silently change");
+
+        assert!(error.to_string().contains("--switch"));
+        assert!(error.to_string().contains("removed"));
+    }
+
+    #[test]
+    fn multi_profile_new_state_requires_interactive_selection() {
+        let profiles = vec![test_profile("first"), test_profile("second")];
+
+        let error = select_llm_profile(&profiles, None, false, Path::new("book.epub"))
+            .err()
+            .expect("non-interactive selection must fail");
+
+        assert!(error.to_string().contains("interactive terminal"));
+    }
+
+    #[test]
+    fn saved_snapshot_is_kept_exactly_without_overrides() {
+        let profile = test_profile("saved");
+        let saved = test_snapshot("saved");
+
+        let (effective, changed) = effective_llm_snapshot(
+            &profile,
+            Some(&saved),
+            &config::LlmConfigOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(effective, saved);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn resume_canonicalizes_scheme_less_base_url() {
+        let profile = test_profile("saved");
+        let mut saved = test_snapshot("saved");
+        saved.base_url = "apiclaude.cc".to_string();
+
+        let (effective, changed) = effective_llm_snapshot(
+            &profile,
+            Some(&saved),
+            &config::LlmConfigOverrides::default(),
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(effective.base_url, "https://apiclaude.cc");
+    }
+
+    #[test]
+    fn saved_snapshot_rejects_overrides_without_switch() {
+        let profile = test_profile("saved");
+        let saved = test_snapshot("saved");
+        let overrides = config::LlmConfigOverrides {
+            model: Some("different-model".to_string()),
+            ..config::LlmConfigOverrides::default()
+        };
+
+        let error = effective_llm_snapshot(&profile, Some(&saved), &overrides)
+            .expect_err("resume override must require switch");
+
+        assert!(error.to_string().contains("--switch"));
+    }
+
+    #[test]
+    fn switch_flag_parses_and_is_translation_only() {
+        let args = Args::try_parse_from(["epub-reader", "book.epub", "--switch"]).unwrap();
+        assert!(args.switch_profile);
+        assert!(validate_args(&args).is_ok());
+
+        for argv in [
+            vec!["epub-reader", "--setup", "--switch"],
+            vec!["epub-reader", "book.epub", "--count", "--switch"],
+            vec!["epub-reader", "book.epub", "--rebuild", "--switch"],
+        ] {
+            let args = Args::try_parse_from(argv).unwrap();
+            let error = validate_args(&args).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("--switch is only available during normal translation"),
+                "{error}"
+            );
+        }
     }
 }

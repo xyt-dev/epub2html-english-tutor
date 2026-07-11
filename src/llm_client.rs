@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::config::{ApiFormat, LlmConfig};
+use crate::config::{is_deepseek_endpoint, ApiFormat, LlmConfig};
 use crate::types::LlmResponse;
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -209,16 +209,26 @@ impl LlmClient {
                     "system": SYSTEM_PROMPT,
                     "messages": [{"role": "user", "content": content}],
                 });
+                let deepseek = is_deepseek_endpoint(&self.config.base_url);
+                body["thinking"] = json!({
+                    "type": match (deepseek, self.config.thinking) {
+                        (true, true) => "enabled",
+                        (false, true) => "adaptive",
+                        (_, false) => "disabled",
+                    },
+                });
                 if self.config.thinking {
-                    body["thinking"] = json!({
-                        "type": "enabled",
-                        "budget_tokens": self.config.thinking_budget_tokens,
-                    });
+                    let effort = if deepseek {
+                        self.config.thinking_effort.normalized_deepseek()
+                    } else {
+                        self.config.thinking_effort.as_str()
+                    };
+                    body["output_config"] = json!({ "effort": effort });
                 }
                 body
             }
             ApiFormat::OpenAi => {
-                json!({
+                let mut body = json!({
                     "model": self.config.model,
                     "max_tokens": max_tokens,
                     "messages": [
@@ -228,7 +238,12 @@ impl LlmClient {
                     "thinking": {
                         "type": if self.config.thinking { "enabled" } else { "disabled" },
                     },
-                })
+                });
+                if self.config.thinking {
+                    body["reasoning_effort"] =
+                        json!(self.config.thinking_effort.normalized_deepseek());
+                }
+                body
             }
         }
     }
@@ -697,16 +712,18 @@ fn strip_code_fence(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThinkingEffort;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_llm_config(format: ApiFormat, base_url: String) -> LlmConfig {
         LlmConfig {
+            profile_name: "test-profile".to_string(),
             format,
             model: "test-model".to_string(),
             base_url,
             thinking: false,
-            thinking_budget_tokens: 4096,
+            thinking_effort: crate::config::ThinkingEffort::High,
             max_output_tokens: 1024,
             request_timeout_secs: 5,
             api_key: "test-key".to_string(),
@@ -739,39 +756,103 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_request_omits_thinking_when_disabled() {
+    fn anthropic_request_explicitly_disables_thinking() {
         let config = test_llm_config(ApiFormat::Anthropic, "http://example.invalid".to_string());
         let client = LlmClient::new(config, false);
         let body = client.build_request_body("content", 1024);
-        assert!(body.get("thinking").is_none());
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]
-    fn anthropic_request_includes_thinking_budget_when_enabled() {
+    fn anthropic_request_uses_official_effort_without_budget() {
         let mut config =
             test_llm_config(ApiFormat::Anthropic, "http://example.invalid".to_string());
         config.thinking = true;
-        config.thinking_budget_tokens = 2048;
+        config.thinking_effort = ThinkingEffort::Medium;
         let client = LlmClient::new(config, false);
         let body = client.build_request_body("content", 4096);
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["output_config"]["effort"], "medium");
     }
 
     #[test]
-    fn openai_request_thinking_type_reflects_config() {
+    fn claude_sonnet_5_uses_adaptive_thinking_and_exact_effort() {
+        let mut config = test_llm_config(ApiFormat::Anthropic, "https://apiclaude.cc".to_string());
+        config.model = "claude-sonnet-5".to_string();
+        config.thinking = true;
+        config.thinking_effort = ThinkingEffort::Max;
+        let client = LlmClient::new(config, false);
+
+        let body = client.build_request_body("content", 8192);
+
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn claude_sonnet_5_explicitly_disables_default_adaptive_thinking() {
+        let mut config = test_llm_config(ApiFormat::Anthropic, "https://apiclaude.cc".to_string());
+        config.model = "claude-sonnet-5".to_string();
+        config.thinking = false;
+        let client = LlmClient::new(config, false);
+
+        let body = client.build_request_body("content", 8192);
+
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn deepseek_anthropic_request_includes_normalized_effort() {
+        let mut config = test_llm_config(
+            ApiFormat::Anthropic,
+            "https://api.deepseek.com/anthropic".to_string(),
+        );
+        config.thinking = true;
+        config.thinking_effort = ThinkingEffort::XHigh;
+        let client = LlmClient::new(config, false);
+        let body = client.build_request_body("content", 4096);
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn openai_request_thinking_type_and_effort_reflect_config() {
         let mut enabled_config =
             test_llm_config(ApiFormat::OpenAi, "http://example.invalid".to_string());
         enabled_config.thinking = true;
+        enabled_config.thinking_effort = ThinkingEffort::Medium;
         let enabled_client = LlmClient::new(enabled_config, false);
         let enabled_body = enabled_client.build_request_body("content", 4096);
         assert_eq!(enabled_body["thinking"]["type"], "enabled");
+        assert_eq!(enabled_body["reasoning_effort"], "high");
 
         let disabled_config =
             test_llm_config(ApiFormat::OpenAi, "http://example.invalid".to_string());
         let disabled_client = LlmClient::new(disabled_config, false);
         let disabled_body = disabled_client.build_request_body("content", 4096);
         assert_eq!(disabled_body["thinking"]["type"], "disabled");
+        assert!(disabled_body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_effort_levels_are_normalized_to_supported_values() {
+        let cases = [
+            (ThinkingEffort::Low, "high"),
+            (ThinkingEffort::Medium, "high"),
+            (ThinkingEffort::High, "high"),
+            (ThinkingEffort::XHigh, "max"),
+            (ThinkingEffort::Max, "max"),
+        ];
+
+        for (effort, expected) in cases {
+            assert_eq!(effort.normalized_deepseek(), expected);
+        }
     }
 
     #[tokio::test]

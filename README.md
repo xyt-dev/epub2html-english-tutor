@@ -35,14 +35,11 @@
 # 安装 Rust（若未安装）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# LLM 相关设置（provider/model/base_url/thinking）统一放在平台标准配置目录下的
-# llm.toml 中（如 ~/.config/epub-reader/llm.toml），项目目录里的 llm.toml 只是
-# 一份可读模板，程序运行时不会读取它。首次使用建议跑一遍交互式配置向导：
+# LLM provider/model 等设置统一保存在平台标准配置目录的 llm.toml 中
+#（如 ~/.config/epub-reader/llm.toml）。项目目录里的 llm.toml 仅为模板。
+# 每次运行向导会追加一个可复用模型配置；API Key 输入会直接显示：
 cargo run --release -- --setup
-# 向导只问常用字段（provider/model/base_url/api_key_env/thinking/jobs），
-# 写完后按提示设置对应的环境变量，例如：
-export ANTHROPIC_AUTH_TOKEN="sk-ant-..."   # provider = "anthropic" 时
-# export DEEPSEEK_API_KEY="sk-..."        # provider = "openai" 时（DeepSeek 原生 API）
+# 也可以不把 Key 写入配置，改用该 profile 的 api_key_env 环境变量兜底。
 ```
 
 ### 编译
@@ -131,10 +128,10 @@ cargo run --release -- --rebuild ./books ./output
 ## 命令行用法
 
 ```text
-Usage: epub-reader [OPTIONS] <INPUT> [OUTPUT]
+Usage: epub-reader [OPTIONS] [INPUT] [OUTPUT]
 
 Arguments:
-  <INPUT>   Input file or directory (.epub/.md/.markdown/.txt)
+  [INPUT]   Input file or directory (.epub/.md/.markdown/.txt); required unless --setup is used
   [OUTPUT]  Output directory for HTML and state files [default: output]
 
 Options:
@@ -142,10 +139,14 @@ Options:
           Rebuild HTML from existing state files without API calls
       --count
           Count translatable source text and exit without API calls or output files
+      --setup
+          Run the interactive LLM setup wizard and exit
+      --switch
+          Select a different LLM profile for each translated book
   -v, --verbose
           Print full LLM request and response bodies to stderr
       --jobs <JOBS>
-          Maximum number of concurrent translation requests [default: 2]
+          Override concurrent translation requests from the LLM config
       --request-delay-ms <REQUEST_DELAY_MS>
           Delay in milliseconds before launching each translation request [default: 0]
       --context-paragraphs <CONTEXT_PARAGRAPHS>
@@ -160,6 +161,20 @@ Options:
           In .txt files, treat each non-empty line as its own paragraph
       --txt-no-sentence-split
           In .txt files, do not start a new paragraph after sentence-ending punctuation
+      --llm-config <PATH>
+          Path to the LLM provider config file (default: platform config dir, e.g. ~/.config/epub-reader/llm.toml)
+      --llm-provider <PROVIDER>
+          Override the LLM API format from the LLM config: 'anthropic' or 'openai'
+      --llm-model <MODEL>
+          Override the LLM model from the LLM config
+      --llm-base-url <URL>
+          Override the LLM API base URL from the LLM config
+      --llm-thinking
+          Enable model thinking/reasoning mode (overrides the LLM config; default off)
+      --llm-thinking-effort <LEVEL>
+          Set model thinking/reasoning effort: low, medium, high, xhigh, or max (also enables thinking) [possible values: low, medium, high, xhigh, max]
+      --llm-no-thinking
+          Disable model thinking/reasoning mode (overrides the LLM config)
   -h, --help
           Print help
   -V, --version
@@ -393,47 +408,70 @@ src/
 └── types.rs           # Book / Paragraph / LlmResponse 等结构
 ```
 
-## LLM 配置
+## LLM 配置与模型选择
 
-配置文件不在项目目录里，而是放在平台标准配置目录下（可用 `--llm-config` 指定别的路径）：
+实际配置文件位于平台标准配置目录（可用 `--llm-config` 指定其他路径）：
 
 - Linux: `$XDG_CONFIG_HOME/epub-reader/llm.toml`（未设置时为 `~/.config/epub-reader/llm.toml`）
 - macOS: `~/Library/Application Support/epub-reader/llm.toml`
 - Windows: `%APPDATA%\epub-reader\llm.toml`
 
-项目目录里的 `llm.toml` 只是一份带注释的模板/示例，程序运行时从不读取它。
-
-最简单的配置方式是跑一遍交互式向导，它只问常用字段，写完直接生效：
+项目根目录的 `llm.toml` 只是一份带注释模板，运行时不会读取。最简单的维护方式是运行向导；**每运行一次就追加一个 profile**，不会覆盖已有项：
 
 ```bash
 cargo run --release -- --setup
 ```
 
-配置文件也可以手写，格式如下：
+也可以手写。配置是 `[[llm]]` 数组，每个 profile 必须有唯一名称：
 
 ```toml
-[llm]
-provider = "anthropic"        # "anthropic" 或 "openai"
-model = "deepseek-v4-flash"
-base_url = "https://api.anthropic.com"
-thinking = false              # 默认关闭；DeepSeek/Claude 均支持开启
-# thinking_budget_tokens = 4096
-# api_key_env = "ANTHROPIC_AUTH_TOKEN"
-# max_output_tokens = 8192
+[[llm]]
+name = "deepseek-pro"
+provider = "openai"                 # "anthropic" 或 "openai"
+model = "deepseek-v4-pro"
+base_url = "api.deepseek.com"       # 省略协议时自动补 https://
+api_key = "..."                     # 可选：直接保存在平台配置中
+api_key_env = "DEEPSEEK_API_KEY"    # 可选：没有 api_key 时的环境变量兜底
+thinking = false
+# thinking_effort = "high"          # low / medium / high / xhigh / max
+max_output_tokens = 32768
 # request_timeout_secs = 180
+jobs = 10
+
+[[llm]]
+name = "anthropic-default"
+provider = "anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "ANTHROPIC_AUTH_TOKEN"
+thinking = false
 jobs = 2
 ```
 
-- `provider = "anthropic"`：走 Anthropic Messages API（`/v1/messages`），兼容官方地址和各类中转站
-- `provider = "openai"`：走 OpenAI Chat Completions 格式（`/chat/completions`），兼容 DeepSeek 官方 API
-- API Key 永远只从环境变量读取，变量名由 `api_key_env` 指定（默认 `anthropic` 对应 `ANTHROPIC_AUTH_TOKEN`，`openai` 对应 `DEEPSEEK_API_KEY`），不会写进配置文件
-- 优先级：CLI 参数 > 配置文件 > 内置默认值。CLI 覆盖项：`--llm-provider` `--llm-model` `--llm-base-url` `--llm-thinking` / `--llm-no-thinking` `--jobs`
-- `thinking` 默认关闭；`--llm-thinking` 和 `--llm-no-thinking` 不能同时使用
-- 没有配置文件时，程序会退回到 CLI 参数 + 内置默认值运行；跑 `--setup` 即可交互式创建一份
+### profile 生命周期
+
+- 新书只有一个 profile 时自动选中；存在多个时在终端选择一次。
+- 选择后，实际生效的非敏感配置会写在该书 `*_state.json` 的首个 `llm` 字段中。API Key 永远不会进入 state。
+- 断点续传时直接复用 state 里的 provider / model / base URL / thinking / jobs 等快照，只从同名 profile 重新取得当前 Key；之后修改 profile 的模型参数不会悄悄改变旧书。
+- 需要让旧书切换模型时显式使用 `--switch`，程序会重新选择并覆盖 state 中的 `llm` 快照。已完成段落会保留，因此切换后最终输出可能混用模型。
+- 旧版、尚无 `llm` 字段的 state 仍可读取；下一次正常翻译会选择一次 profile 并补写快照。
+- 如果 state 绑定的 profile 已被删除，程序会报错并要求用 `--switch` 选择替代项，不会静默换模型。
+
+### 凭据与覆盖规则
+
+- Key 优先级：profile 内非空 `api_key` > `api_key_env` 指定的环境变量 > provider 默认环境变量（Anthropic 为 `ANTHROPIC_AUTH_TOKEN`，OpenAI/DeepSeek 为 `DEEPSEEK_API_KEY`）。
+- 向导中的 Key 输入是可见明文。Unix 上配置文件以 `0600` 写入；Key 不会写入 state、日志或错误信息。配置文件仍是本机明文凭据，请按敏感文件管理。
+- 非敏感设置优先级：CLI 覆盖 > 所选 profile > 内置默认值。CLI 覆盖项包括 `--llm-provider`、`--llm-model`、`--llm-base-url`、`--llm-thinking` / `--llm-no-thinking`、`--llm-thinking-effort`、`--jobs`。
+- 新书或 `--switch` 时，CLI 覆盖会固化进该书快照。已有快照直接续传时若要使用覆盖参数，必须同时显式指定 `--switch`。
+- `provider = "anthropic"` 使用 Anthropic Messages API（`/v1/messages`）；`provider = "openai"` 使用 OpenAI Chat Completions（`/chat/completions`，兼容 DeepSeek 官方 API）。
+- `thinking` 默认关闭。`thinking_effort` 接受 `low` / `medium` / `high` / `xhigh` / `max`；单独传 `--llm-thinking-effort` 也会开启 thinking，且不能与 `--llm-no-thinking` 同用。
+- thinking 强度统一使用 provider 官方 effort 字段，不再使用或保存 `thinking_budget_tokens`：Anthropic Messages 使用 `output_config.effort`，OpenAI 格式使用 `reasoning_effort`；DeepSeek 仅把不支持的档位归一到其官方支持值。
+- `base_url` 可以写成 `apiclaude.cc` 这类无协议地址，程序会规范化为 `https://apiclaude.cc`；显式 `http://` / `https://` 会原样保留。
+- `max_output_tokens` 的内置默认值为 `32768`，可在每个 `[[llm]]` profile 中单独设置，`--setup` 也会询问该值。
+- 没有任何 profile 时，正常翻译会提示运行 `--setup`；`--count` 和 `--rebuild` 不需要 profile 或 API Key。
 
 ## 注意事项
 
-- API Key 只在正常翻译模式下需要（走配置文件里 `api_key_env` 指定的环境变量）；`--rebuild` 不需要
+- API Key 只在正常翻译且仍有待处理段落时需要；可以来自 profile 的 `api_key` 或其环境变量兜底，`--count` / `--rebuild` 均不需要
 - 如果你修改了原始输入文件，段落 ID 可能变化，旧 state 可能无法完全复用
 - `--jobs` 可以设得很高，也不会改变翻译上下文；但是否值得调高取决于你的 provider 并发 / RPM / TPM 限额，以及本次任务总批次数
 - 对排版特别碎的 TXT，建议试试：
